@@ -83,6 +83,14 @@ configuration in a systemd drop-in
 (`~/.config/systemd/user/pi-bridge.service.d/*.conf`) has that configuration applied to the
 service only - export the same variables in your shell before a CLI `submit`, or the bridge
 falls back to its built-in defaults and cannot inherit the orchestrator's model.
+For notifications to reach the right conversation, a submit must know which session
+asked. `submit` takes the session from `--session` / `session_id`, else from
+`$PI_BRIDGE_SESSION_ID`, else from `$HERMES_SESSION_ID`. The chat and topic come from
+that session's row in the orchestrator db; if the db is unavailable they come from
+`$PI_BRIDGE_CHAT_ID` / `$PI_BRIDGE_THREAD_ID` (or `$HERMES_SESSION_CHAT_ID` /
+`$HERMES_SESSION_THREAD_ID`). With no session and no route env the task is stored
+unrouted, and its heartbeat and completion go to the notification default - never to
+an unrelated conversation guessed from the db.
 
 HTTP:
 

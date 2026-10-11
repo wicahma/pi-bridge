@@ -73,3 +73,68 @@ def test_active_session_origin_none_when_only_unroutable(monkeypatch, tmp_path):
     conn.close()
     monkeypatch.setattr(b, "ORCHESTRATOR_DB", db)
     assert b.active_session_origin() == (None, None, None)
+
+
+def test_env_route_prefers_pi_bridge_names(monkeypatch):
+    monkeypatch.setenv("PI_BRIDGE_SESSION_ID", "s-pi")
+    monkeypatch.setenv("PI_BRIDGE_CHAT_ID", "c-pi")
+    monkeypatch.setenv("PI_BRIDGE_THREAD_ID", "t-pi")
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-hermes")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "c-hermes")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "t-hermes")
+    assert b._env_route() == ("s-pi", "c-pi", "t-pi")
+
+
+def test_env_route_falls_back_to_hermes_names(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-hermes")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1274076905")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "3482164")
+    assert b._env_route() == ("s-hermes", "1274076905", "3482164")
+
+
+def test_env_route_empty_when_unset(monkeypatch):
+    assert b._env_route() == (None, None, None)
+
+
+def test_submit_routes_from_hermes_env_when_no_session(monkeypatch, tmp_path):
+    db = tmp_path / "orchestrator.db"
+    conn = _origin_db(db)
+    conn.execute("INSERT INTO sessions VALUES ('s-other','999',NULL,'m',NULL,200.0)")
+    conn.execute("INSERT INTO sessions VALUES ('s-me','1274076905','3482164','m',NULL,100.0)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(b, "ORCHESTRATOR_DB", db)
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-me")
+    monkeypatch.setattr(b, "resolve_model", lambda *a, **k: ("hermes", "session-alias"))
+    monkeypatch.setattr(b, "fit_model_to_pi", lambda m, p: (m, p, None))
+    monkeypatch.setattr(b, "ensure_provider_placeholder", lambda: None)
+
+    class _Proc:
+        pid = 4242
+
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: _Proc())
+    tid = b.submit("probe", "/tmp")
+    row = b.db().execute("SELECT * FROM tasks WHERE task_id=?", (tid,)).fetchone()
+    assert row["origin_chat_id"] == "1274076905"
+    assert row["origin_thread_id"] == "3482164"
+
+
+def test_submit_does_not_route_to_guessed_session(monkeypatch, tmp_path):
+    db = tmp_path / "orchestrator.db"
+    conn = _origin_db(db)
+    conn.execute("INSERT INTO sessions VALUES ('s-other','999',NULL,'m',NULL,200.0)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(b, "ORCHESTRATOR_DB", db)
+    monkeypatch.setattr(b, "resolve_model", lambda *a, **k: ("hermes", "session-alias"))
+    monkeypatch.setattr(b, "fit_model_to_pi", lambda m, p: (m, p, None))
+    monkeypatch.setattr(b, "ensure_provider_placeholder", lambda: None)
+
+    class _Proc:
+        pid = 4243
+
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: _Proc())
+    tid = b.submit("probe", "/tmp")
+    row = b.db().execute("SELECT * FROM tasks WHERE task_id=?", (tid,)).fetchone()
+    assert row["origin_chat_id"] is None
+    assert row["origin_thread_id"] is None

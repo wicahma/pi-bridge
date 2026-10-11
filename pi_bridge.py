@@ -268,6 +268,29 @@ def active_model_from_state(session_id: str | None = None) -> tuple[str | None, 
     return (None, None)
 
 
+def _env_route() -> tuple[str | None, str | None, str | None]:
+    """
+    (session_id, chat_id, thread_id) declared by the calling environment.
+
+    A submit made from the orchestrator's own shell can then route back to the
+    chat that asked, without every caller threading `--session` through. The
+    generic PI_BRIDGE_* names win; the Hermes integration's own variables are the
+    built-in fallback.
+    """
+    def pick(*names: str) -> str | None:
+        for name in names:
+            value = os.environ.get(name)
+            if value:
+                return value
+        return None
+
+    return (
+        pick("PI_BRIDGE_SESSION_ID", "HERMES_SESSION_ID"),
+        pick("PI_BRIDGE_CHAT_ID", "HERMES_SESSION_CHAT_ID"),
+        pick("PI_BRIDGE_THREAD_ID", "HERMES_SESSION_THREAD_ID"),
+    )
+
+
 def active_session_origin(session_id: str | None = None) -> tuple[str | None, str | None, str | None]:
     """
     Returns (session_id, chat_id, thread_id) for the active session in the
@@ -854,6 +877,8 @@ def submit(
     task_id = uuid.uuid4().hex[:16]
     session_id = f"pi-{task_id}"
     cwd = str(Path(cwd).resolve())
+    env_session, env_chat, env_thread = _env_route()
+    session = session or env_session
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -907,6 +932,12 @@ def submit(
 
     now = time.time()
     _, origin_chat, origin_thread = active_session_origin(session)
+    if not session:
+        # active_session_origin fell back to the newest session, which belongs to
+        # some other conversation - never deliver this task's notifications there.
+        origin_chat, origin_thread = None, None
+    if not origin_chat:
+        origin_chat, origin_thread = env_chat, env_thread
 
     conn = db()
     try:
@@ -1243,7 +1274,9 @@ def main() -> int:
     s.add_argument("--provider")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     s.add_argument("--systemd", action="store_true", help="run as a user systemd unit")
-    s.add_argument("--session", help="orchestrator session id to inherit the model from")
+    s.add_argument("--session", help="orchestrator session id to inherit the model and route "
+                                     "notifications from; defaults to $PI_BRIDGE_SESSION_ID "
+                                     "(or $HERMES_SESSION_ID)")
     s.add_argument("--allow-alias", action="store_true",
                    help="allow internal alias models like 'hermes'")
     s.add_argument("--context", help="opaque JSON object echoed in every notification")

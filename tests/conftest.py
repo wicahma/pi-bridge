@@ -10,7 +10,9 @@ os.environ["PI_BRIDGE_STATE_DIR"] = os.path.join(_ROOT, "state")
 os.environ["PI_CODING_AGENT_SESSION_DIR"] = os.path.join(_ROOT, "pi-sessions")
 for _k in ("PI_BRIDGE_ORCHESTRATOR_DB", "PI_BRIDGE_ORCHESTRATOR_CONFIG",
            "PI_BRIDGE_NOTIFY_URL", "PI_BRIDGE_HEARTBEAT_URL", "PI_BRIDGE_MODEL",
-           "PI_BRIDGE_NOTIFY_SECRET"):
+           "PI_BRIDGE_NOTIFY_SECRET", "PI_BRIDGE_SESSION_ID", "PI_BRIDGE_CHAT_ID",
+           "PI_BRIDGE_THREAD_ID", "HERMES_SESSION_ID", "HERMES_SESSION_CHAT_ID",
+           "HERMES_SESSION_THREAD_ID"):
     os.environ.pop(_k, None)
 
 import pi_bridge as b
