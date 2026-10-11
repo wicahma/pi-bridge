@@ -8,6 +8,12 @@ Type=simple
 WorkingDirectory=%h/.local/state/pi-bridge
 ExecStart=/usr/bin/python3 %h/.local/share/pi-bridge/pi_bridge.py serve
 
+# pi (and its node runtime) live under ~/.local/bin, which systemd does not
+# inherit from the login shell - without this the HTTP /submit route dies
+# with FileNotFoundError: 'pi' while CLI submits still work.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PI_BIN=%h/.local/bin/pi
+
 # --- engine ---
 Environment=PI_BRIDGE_STATE_DIR=%h/.local/state/pi-bridge
 Environment=PI_BRIDGE_PORT=8799
