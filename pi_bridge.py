@@ -805,9 +805,13 @@ def fit_model_to_pi(model: str, provider: str | None) -> tuple[str, str | None, 
     """
     Return (model, provider, note) adjusted so Pi can actually start.
     `note` is None when nothing changed, "provider" when the passthrough provider
-    was attached, "model" when the model fell back to FALLBACK_MODEL.
+    was attached, "model" when the model fell back to FALLBACK_MODEL,
+    "provider-dropped" when an unresolved model forced the provider off (Pi
+    rejects `--provider` without `--model`).
     """
-    if not model or model_is_resolvable(model, provider):
+    if not model:
+        return model, None, "provider-dropped" if provider else None
+    if model_is_resolvable(model, provider):
         return model, provider, None
     if not provider:
         passthrough = passthrough_provider()

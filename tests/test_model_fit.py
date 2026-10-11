@@ -58,6 +58,12 @@ def test_fit_leaves_resolvable_pairs_alone(tmp_path, monkeypatch):
     assert b.fit_model_to_pi("anything", "local") == ("anything", "local", None)
 
 
+def test_fit_drops_provider_when_model_is_empty(tmp_path, monkeypatch):
+    _catalog(tmp_path, monkeypatch)
+    assert b.fit_model_to_pi("", "local") == ("", None, "provider-dropped")
+    assert b.fit_model_to_pi("", None) == ("", None, None)
+
+
 def test_fit_falls_back_without_passthrough(tmp_path, monkeypatch):
     _catalog(tmp_path, monkeypatch, {"providers": {"dead": {"models": []}}})
     monkeypatch.setattr(b, "FALLBACK_MODEL", "fallback-model")
