@@ -51,6 +51,24 @@ receiver routes a message without the bridge knowing anything about routing:
 
 Keys are echoed verbatim; `null` values are dropped.
 
+### Routing
+
+A notification can only reach the right conversation if the submit knows which
+session asked. Resolution order, first hit wins:
+
+| Field | Sources, in order |
+| --- | --- |
+| session | `session_id` / `--session` → `$PI_BRIDGE_SESSION_ID` → `$HERMES_SESSION_ID` |
+| chat | that session's row in the orchestrator db → `$PI_BRIDGE_CHAT_ID` → `$HERMES_SESSION_CHAT_ID` |
+| thread | same row → `$PI_BRIDGE_THREAD_ID` → `$HERMES_SESSION_THREAD_ID` |
+
+The db is consulted only for the session named above. With no session and no
+route env the task is stored **unrouted**: its heartbeat and completion go to
+the notification default, never to a conversation guessed from the db.
+
+`context` is the explicit override and needs no session at all — pass
+`chat_id` / `thread_id` there and the bridge routes without resolving anything.
+
 ## Direction 2 — bridge → orchestrator
 
 ### Completion — `X-GitHub-Event: pi-task`
