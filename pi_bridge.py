@@ -89,11 +89,34 @@ HEARTBEAT_URL = os.environ.get("PI_BRIDGE_HEARTBEAT_URL", "")
 HEARTBEAT_INTERVAL = int(os.environ.get("PI_BRIDGE_HEARTBEAT_INTERVAL", "60"))
 
 
+def _task_context(row: sqlite3.Row) -> dict:
+    """Routing context to attach to every notification for this task.
+
+    Merges the caller-supplied opaque `context` blob with the orchestrator's
+    session route when one was resolved at submit time. Keys the engine owns are
+    never overwritten, and null values are dropped so a receiver sees an absent
+    key rather than a null one.
+    """
+    out: dict = {}
+    raw = row["context"] if "context" in row.keys() else None
+    if raw:
+        try:
+            blob = json.loads(raw)
+            if isinstance(blob, dict):
+                out.update({k: v for k, v in blob.items() if v is not None})
+        except (json.JSONDecodeError, TypeError):
+            pass
+    for key, col in (("chat_id", "origin_chat_id"), ("thread_id", "origin_thread_id")):
+        if col in row.keys() and row[col] is not None:
+            out[key] = row[col]
+    for reserved in ("task_id", "status", "state", "delivery_id"):
+        out.pop(reserved, None)
+    return out
+
+
 def _wake_payload(row: sqlite3.Row) -> dict:
     """Shape the callback payload from the finished task row."""
-    origin_chat = row["origin_chat_id"] if "origin_chat_id" in row.keys() else None
-    origin_thread = row["origin_thread_id"] if "origin_thread_id" in row.keys() else None
-    return {
+    payload = {
         "task_id": row["task_id"],
         "status": row["status"],
         "cwd": row["cwd"],
@@ -101,9 +124,9 @@ def _wake_payload(row: sqlite3.Row) -> dict:
         "resolution": row["resolution"],
         "resolved_by": row["resolved_by"],
         "result_text": (row["result_text"] or "")[:4000],
-        "chat_id": origin_chat or "1274076905",
-        "thread_id": origin_thread or "3482164",
     }
+    payload.update(_task_context(row))
+    return payload
 
 
 def _post_signed(url: str, payload: dict, event: str) -> None:
@@ -238,8 +261,11 @@ def active_model_from_state(session_id: str | None = None) -> tuple[str | None, 
 
 def active_session_origin(session_id: str | None = None) -> tuple[str | None, str | None, str | None]:
     """
-    Returns (session_id, chat_id, thread_id) of the active Hermes session.
-    Used to route wake notifications directly back to the requesting chat and topic.
+    Returns (session_id, chat_id, thread_id) for the active session in the
+    orchestrator's state db, so notifications can be routed back to the chat and
+    topic that asked. Opt-in: returns (None, None, None) unless
+    PI_BRIDGE_ORCHESTRATOR_DB is set and its `sessions` table has these columns.
+    Callers that route their own way should pass `context=` to submit() instead.
     """
     if not ORCHESTRATOR_DB or not ORCHESTRATOR_DB.is_file():
         return (None, None, None)
@@ -390,7 +416,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     log_path      TEXT,
     model_source  TEXT,                   -- explicit|env|session|config|fallback
     origin_chat_id   TEXT,
-    origin_thread_id TEXT
+    origin_thread_id TEXT,
+    context          TEXT                 -- opaque JSON supplied by the caller
 );
 """
 
@@ -413,6 +440,9 @@ def db() -> sqlite3.Connection:
         conn.commit()
     if "origin_thread_id" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN origin_thread_id TEXT")
+        conn.commit()
+    if "context" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN context TEXT")
         conn.commit()
     return conn
 
@@ -570,7 +600,7 @@ def task_status(row: sqlite3.Row) -> dict:
             f"last tool: {act['last_tool']}" if act["last_tool"] else "starting"
         )
 
-    return {
+    out = {
         "task_id": row["task_id"],
         "state": state,
         "elapsed": f"{elapsed // 60}m{elapsed % 60:02d}s",
@@ -579,9 +609,9 @@ def task_status(row: sqlite3.Row) -> dict:
         "detail": detail,
         "cwd": row["cwd"],
         "model": row["model"],
-        "chat_id": row["origin_chat_id"] or "1274076905",
-        "thread_id": row["origin_thread_id"] or "3482164",
     }
+    out.update(_task_context(row))
+    return out
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -743,6 +773,7 @@ def submit(
     use_systemd: bool = False,
     session: str | None = None,
     allow_alias: bool = False,
+    context: dict | None = None,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -804,20 +835,19 @@ def submit(
 
     now = time.time()
     _, origin_chat, origin_thread = active_session_origin(session)
-    origin_chat = origin_chat or "1274076905"
-    origin_thread = origin_thread or "3482164"
 
     conn = db()
     try:
         conn.execute(
             """INSERT INTO tasks (task_id, prompt, cwd, session_id, model, provider,
                    pid, status, created_at, started_at, deadline, log_path, model_source,
-                   origin_chat_id, origin_thread_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   origin_chat_id, origin_thread_id, context)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, prompt, cwd, session_id, chosen_model, provider, pid,
                 "running", now, now, now + timeout, str(log_path), model_source,
                 origin_chat, origin_thread,
+                json.dumps(context) if context else None,
             ),
         )
         conn.commit()
@@ -1035,6 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=int(payload.get("timeout", DEFAULT_TIMEOUT)),
                 session=payload.get("session_id"),
                 allow_alias=bool(payload.get("allow_alias", False)),
+                context=payload.get("context"),
             )
             return self._json(200, {"ok": True, "task_id": tid})
 
@@ -1125,6 +1156,7 @@ def main() -> int:
     s.add_argument("--session", help="Hermes session id to inherit the model from")
     s.add_argument("--allow-alias", action="store_true",
                    help="allow internal alias models like 'hermes'")
+    s.add_argument("--context", help="opaque JSON object echoed in every notification")
 
     st = sub.add_parser("status")
     st.add_argument("task_id")
@@ -1161,9 +1193,14 @@ def main() -> int:
         return 0
 
     if a.cmd == "submit":
+        try:
+            ctx = json.loads(a.context) if a.context else None
+        except json.JSONDecodeError as exc:
+            print(f"--context is not valid JSON: {exc}", file=sys.stderr)
+            return 2
         tid = submit(a.prompt, a.cwd, model=a.model, provider=a.provider,
                      timeout=a.timeout, use_systemd=a.systemd,
-                     session=a.session, allow_alias=a.allow_alias)
+                     session=a.session, allow_alias=a.allow_alias, context=ctx)
         print(tid)
         return 0
 
