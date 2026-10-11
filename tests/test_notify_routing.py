@@ -21,10 +21,18 @@ def test_task_context_plain_dm_gets_empty_thread(mk_task):
     assert got["thread_id"] == ""
 
 
-def test_task_context_no_route_has_neither_key(mk_task):
+def test_task_context_no_route_emits_empty_pair(mk_task):
     row = mk_task(b.db(), "n2", origin_chat_id=None, origin_thread_id=None)
     got = b._task_context(row)
-    assert "chat_id" not in got and "thread_id" not in got
+    assert got["chat_id"] == "" and got["thread_id"] == ""
+
+def test_task_context_keeps_blob_route_when_no_origin(mk_task):
+    row = mk_task(
+        b.db(), "n2b", origin_chat_id=None,
+        context=json.dumps({"chat_id": "from-blob", "thread_id": "from-blob-t"}),
+    )
+    got = b._task_context(row)
+    assert got["chat_id"] == "from-blob" and got["thread_id"] == "from-blob-t"
 
 
 def test_task_context_both_route_keys_pass_through(mk_task):

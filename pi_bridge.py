@@ -96,9 +96,10 @@ def _task_context(row: sqlite3.Row) -> dict:
     session route when one was resolved at submit time. Keys the engine owns are
     never overwritten, and null values in the caller's blob are dropped so a
     receiver sees an absent key rather than a null one. The orchestrator-resolved
-    route is emitted as a `chat_id`/`thread_id` pair whenever a chat id was
-    resolved, with an empty string for an unknown thread, so a receiver template
-    never renders a literal placeholder.
+    route is always emitted as a `chat_id`/`thread_id` pair - empty strings when
+    no route was resolved - so a receiver template never renders a literal
+    placeholder. A pair supplied by the caller's blob is kept when the engine
+    resolved no route.
     """
     out: dict = {}
     raw = row["context"] if "context" in row.keys() else None
@@ -110,10 +111,13 @@ def _task_context(row: sqlite3.Row) -> dict:
         except (json.JSONDecodeError, TypeError):
             pass
     chat_id = row["origin_chat_id"] if "origin_chat_id" in row.keys() else None
+    thread_id = row["origin_thread_id"] if "origin_thread_id" in row.keys() else None
     if chat_id:
-        thread_id = row["origin_thread_id"] if "origin_thread_id" in row.keys() else None
         out["chat_id"] = chat_id
         out["thread_id"] = thread_id or ""
+    else:
+        out.setdefault("chat_id", "")
+        out.setdefault("thread_id", "")
     for reserved in ("task_id", "status", "state", "delivery_id"):
         out.pop(reserved, None)
     return out
@@ -1112,12 +1116,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        try:
+            self._dispatch_post()
+        except Exception as exc:
+            try:
+                self._json(500, {"ok": False, "error": str(exc)})
+            except Exception:
+                pass
+
+    def _dispatch_post(self):
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) if n else b"{}"
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             return self._json(400, {"ok": False, "error": "bad json"})
+        if not isinstance(payload, dict):
+            return self._json(400, {"ok": False, "error": "body must be a json object"})
 
         if self.path.rstrip("/") == CALLBACK_PATH:
             ok = handle_callback(payload)
@@ -1125,12 +1140,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "accepted": ok})
 
         if self.path.rstrip("/") == "/submit":
+            prompt = payload.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                return self._json(400, {"ok": False, "error": "prompt is required"})
+            try:
+                timeout = int(payload.get("timeout", DEFAULT_TIMEOUT))
+            except (TypeError, ValueError):
+                return self._json(400, {"ok": False, "error": "timeout must be an integer"})
             tid = submit(
-                payload["prompt"],
+                prompt,
                 payload.get("cwd", os.getcwd()),
                 model=payload.get("model"),
                 provider=payload.get("provider"),
-                timeout=int(payload.get("timeout", DEFAULT_TIMEOUT)),
+                timeout=timeout,
                 session=payload.get("session_id"),
                 allow_alias=bool(payload.get("allow_alias", False)),
                 context=payload.get("context"),
@@ -1217,11 +1239,11 @@ def main() -> int:
     s = sub.add_parser("submit")
     s.add_argument("prompt")
     s.add_argument("--cwd", default=os.getcwd())
-    s.add_argument("--model", help="explicit model; omit to inherit the Hermes model")
+    s.add_argument("--model", help="explicit model; omit to inherit the orchestrator's current model")
     s.add_argument("--provider")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     s.add_argument("--systemd", action="store_true", help="run as a user systemd unit")
-    s.add_argument("--session", help="Hermes session id to inherit the model from")
+    s.add_argument("--session", help="orchestrator session id to inherit the model from")
     s.add_argument("--allow-alias", action="store_true",
                    help="allow internal alias models like 'hermes'")
     s.add_argument("--context", help="opaque JSON object echoed in every notification")

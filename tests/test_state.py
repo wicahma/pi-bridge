@@ -75,7 +75,7 @@ def test_context_origin_columns_win_over_blob(mk_task):
 def test_context_bad_json_is_ignored(mk_task):
     row = mk_task(b.db(), "c3", context="not json at all")
     got = b._wake_payload(row)
-    assert "chat_id" not in got and "thread_id" not in got
+    assert got["chat_id"] == "" and got["thread_id"] == ""
 
 
 def test_wake_payload_truncates_result_text(mk_task):
