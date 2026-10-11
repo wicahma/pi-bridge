@@ -2,12 +2,12 @@
  * Hermes callback extension for Pi.
  *
  * Fires once, when the run is truly finished (`agent_settled`), and POSTs a
- * JSON callback to the orchestrator. This is what removes the need for Hermes
- * to hold a blocking listen on Pi for hours.
+ * JSON callback to the bridge. This is what removes the need for the
+ * orchestrator to hold a blocking listen on Pi for hours.
  *
- * Config via environment variables set by Hermes when it spawns Pi:
- *   HERMES_CALLBACK_URL  e.g. http://127.0.0.1:8799/callback
- *   HERMES_TASK_ID       opaque id Hermes uses to resume the task
+ * Config via environment variables injected when the bridge spawns Pi:
+ *   PI_BRIDGE_CALLBACK_URL  e.g. http://127.0.0.1:8799/callback
+ *   PI_BRIDGE_TASK_ID       opaque id the bridge uses to correlate the task
  *
  * IMPORTANT: the reported status is derived from the run's actual stop reason.
  * Hardcoding "done" here would report a failed run as a success - and because a
@@ -17,7 +17,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	const url = process.env.HERMES_CALLBACK_URL;
+	const url = process.env.PI_BRIDGE_CALLBACK_URL;
 	if (!url) return; // no orchestrator configured -> no-op
 
 	const started = Date.now();
@@ -35,7 +35,7 @@ export default function (pi: ExtensionAPI) {
 		settled = true;
 
 		const payload = {
-			task_id: process.env.HERMES_TASK_ID ?? null,
+			task_id: process.env.PI_BRIDGE_TASK_ID ?? null,
 			status,
 			stop_reason: stopReason,
 			error: errorMessage,

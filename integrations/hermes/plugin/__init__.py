@@ -6,7 +6,7 @@ rather than a dozen registrations. Registered names are ``pi-*``:
     pi-status [task_id]   bridge + task state
     pi-model              which model Pi would use, and why
     pi-model-set <id>     pin the model Pi runs with
-    pi-model-clear        go back to inheriting the Hermes model
+    pi-model-clear        go back to inheriting the orchestrator's model
     pi-tasks [n]          recent tasks
     pi-wake               wake-layer configuration and reachability
     pi-help               this list
@@ -28,8 +28,21 @@ from pathlib import Path
 from typing import Optional
 
 HOME = Path.home()
-BRIDGE_DIR = HOME / ".hermes" / "pi-bridge"
+
+
+def _state_dir() -> Path:
+    """The bridge's state dir, resolved the same way the engine resolves it."""
+    if os.environ.get("PI_BRIDGE_STATE_DIR"):
+        return Path(os.environ["PI_BRIDGE_STATE_DIR"])
+    if os.environ.get("PI_BRIDGE_DIR"):
+        return Path(os.environ["PI_BRIDGE_DIR"])
+    xdg = os.environ.get("XDG_STATE_HOME")
+    return (Path(xdg) if xdg else HOME / ".local" / "state") / "pi-bridge"
+
+
+BRIDGE_DIR = _state_dir()
 STATE_DB = BRIDGE_DIR / "state.db"
+ORCHESTRATOR_DB = os.environ.get("PI_BRIDGE_ORCHESTRATOR_DB")
 PI_SETTINGS = HOME / ".pi" / "agent" / "settings.json"
 PI_MODELS = HOME / ".pi" / "agent" / "models.json"
 
@@ -40,14 +53,14 @@ _HELP = """pi-* commands (Pi coding-agent bridge)
   pi-status [task_id]   bridge health + task counts (or one task in detail)
   pi-model              show the model Pi would use next, and where it came from
   pi-model-set <id>     pin Pi to a specific model
-  pi-model-clear        unpin; Pi inherits the model Hermes is using
+  pi-model-clear        unpin; Pi inherits the model the orchestrator is using
   pi-tasks [n]          list recent tasks (default 10)
   pi-wake               show wake-layer config and whether the endpoint answers
   pi-help               this list
 
-Pi model resolution order: explicit pin -> env HERMES_PI_MODEL -> the model
-Hermes is currently using -> config default. A pin applies to the NEXT task, not
-one already running."""
+Pi model resolution order: explicit pin -> env PI_BRIDGE_MODEL -> the model the
+orchestrator is currently using -> config default. A pin applies to the NEXT
+task, not one already running."""
 
 
 # ---------------------------------------------------------------- helpers
@@ -93,9 +106,11 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
-def _hermes_active_model() -> Optional[str]:
-    """The model Hermes is using right now, from its own state db."""
-    db = HOME / ".hermes" / "state.db"
+def _orchestrator_active_model() -> Optional[str]:
+    """The model the orchestrator is using right now, from its own state db."""
+    if not ORCHESTRATOR_DB:
+        return None
+    db = Path(ORCHESTRATOR_DB)
     if not db.is_file():
         return None
     try:
@@ -166,15 +181,15 @@ def _cmd_model(args: list[str]) -> str:
 
     pinned = settings.get("defaultModel")
     provider = settings.get("defaultProvider")
-    active = _hermes_active_model()
-    env_pin = os.environ.get("HERMES_PI_MODEL")
+    active = _orchestrator_active_model()
+    env_pin = os.environ.get("PI_BRIDGE_MODEL")
 
     lines = [
         "Pi model resolution",
         "",
         f"  pinned in settings.json : {pinned or '(none)'}",
-        f"  env HERMES_PI_MODEL     : {env_pin or '(unset)'}",
-        f"  Hermes active model     : {active or '(unknown)'}",
+        f"  env PI_BRIDGE_MODEL     : {env_pin or '(unset)'}",
+        f"  orchestrator active     : {active or '(unknown)'}",
         f"  provider                : {provider or '(unset)'}",
     ]
 
@@ -182,7 +197,7 @@ def _cmd_model(args: list[str]) -> str:
     if env_pin:
         eff, why = env_pin, "env override"
     elif active:
-        eff, why = active, "inherits Hermes (per task)"
+        eff, why = active, "inherits the orchestrator (per task)"
     elif pinned:
         eff, why = pinned, "settings.json default"
     else:
@@ -284,11 +299,11 @@ def _bridge_service_env(key: str) -> str:
 
 
 def _cmd_wake(args: list[str]) -> str:
-    url = _bridge_service_env("PI_BRIDGE_WAKE_URL")
-    secret = _bridge_service_env("PI_BRIDGE_WAKE_SECRET")
+    url = _bridge_service_env("PI_BRIDGE_NOTIFY_URL")
+    secret = _bridge_service_env("PI_BRIDGE_NOTIFY_SECRET")
     lines = ["Wake layer", ""]
     if not url:
-        lines.append("  disabled (PI_BRIDGE_WAKE_URL unset in the bridge service)")
+        lines.append("  disabled (PI_BRIDGE_NOTIFY_URL unset in the bridge service)")
         return "\n".join(lines)
 
     lines.append(f"  endpoint : {url}")
