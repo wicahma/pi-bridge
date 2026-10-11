@@ -94,8 +94,11 @@ def _task_context(row: sqlite3.Row) -> dict:
 
     Merges the caller-supplied opaque `context` blob with the orchestrator's
     session route when one was resolved at submit time. Keys the engine owns are
-    never overwritten, and null values are dropped so a receiver sees an absent
-    key rather than a null one.
+    never overwritten, and null values in the caller's blob are dropped so a
+    receiver sees an absent key rather than a null one. The orchestrator-resolved
+    route is emitted as a `chat_id`/`thread_id` pair whenever a chat id was
+    resolved, with an empty string for an unknown thread, so a receiver template
+    never renders a literal placeholder.
     """
     out: dict = {}
     raw = row["context"] if "context" in row.keys() else None
@@ -106,9 +109,11 @@ def _task_context(row: sqlite3.Row) -> dict:
                 out.update({k: v for k, v in blob.items() if v is not None})
         except (json.JSONDecodeError, TypeError):
             pass
-    for key, col in (("chat_id", "origin_chat_id"), ("thread_id", "origin_thread_id")):
-        if col in row.keys() and row[col] is not None:
-            out[key] = row[col]
+    chat_id = row["origin_chat_id"] if "origin_chat_id" in row.keys() else None
+    if chat_id:
+        thread_id = row["origin_thread_id"] if "origin_thread_id" in row.keys() else None
+        out["chat_id"] = chat_id
+        out["thread_id"] = thread_id or ""
     for reserved in ("task_id", "status", "state", "delivery_id"):
         out.pop(reserved, None)
     return out
@@ -282,6 +287,7 @@ def active_session_origin(session_id: str | None = None) -> tuple[str | None, st
             row = conn.execute(
                 """SELECT id, chat_id, thread_id FROM sessions
                    WHERE model IS NOT NULL AND model != ''
+                     AND chat_id IS NOT NULL AND chat_id NOT LIKE 'webhook:%'
                    ORDER BY (ended_at IS NULL) DESC, last_activity_at DESC
                    LIMIT 1"""
             ).fetchone()
