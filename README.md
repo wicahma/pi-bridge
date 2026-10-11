@@ -78,6 +78,12 @@ pi-bridge probe  3f9a1c2e8b7d4a06     # heartbeat classification, without waitin
 pi-bridge list
 ```
 
+The CLI reads the same `PI_BRIDGE_*` environment as the service. A host that keeps its
+configuration in a systemd drop-in
+(`~/.config/systemd/user/pi-bridge.service.d/*.conf`) has that configuration applied to the
+service only - export the same variables in your shell before a CLI `submit`, or the bridge
+falls back to its built-in defaults and cannot inherit the orchestrator's model.
+
 HTTP:
 
 ```sh
@@ -133,7 +139,7 @@ Every knob is an environment variable. Unset means "feature off", so a bare
 | `PI_BRIDGE_FALLBACK_MODEL` | *(unset)* | model when nothing else resolves; unset = let Pi decide |
 | `PI_BRIDGE_MODEL_ALIASES` | *(unset)* | comma-separated routing aliases that are never used as model ids |
 | `PI_BRIDGE_PASSTHROUGH_PROVIDERS` | *(unset)* | providers allowed to serve undeclared model ids |
-| `PI_BRIDGE_ORCHESTRATOR_DB` | *(unset)* | orchestrator SQLite db, to inherit its live model |
+| `PI_BRIDGE_ORCHESTRATOR_DB` | *(unset)* | orchestrator SQLite db, to inherit its live model; must be set in every process that reads it - the bridge **and** the orchestrator process hosting the plugin |
 | `PI_BRIDGE_ORCHESTRATOR_CONFIG` | *(unset)* | orchestrator YAML, for its default model |
 | `PI_BRIDGE_DIR` | *(unset)* | legacy alias for `PI_BRIDGE_STATE_DIR` |
 | `PI_BIN` | `pi` | pi executable |
