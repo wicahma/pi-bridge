@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Pi ↔ Hermes bridge.
+Pi agent bridge.
 
+Supervise the Pi coding agent from any orchestrator: dispatch a task and return
+immediately, then learn the outcome from a signed push callback. The bridge is
+deliberately orchestrator-agnostic - it stores whatever opaque context the caller
+supplies and echoes it back in notifications, so it never needs to know what a
+chat, topic or thread is.
 Spawning a Pi task is fire-and-forget: this process never blocks on Pi.
 Completion arrives by push callback (Pi -> here), and the watchdog closes the
 two gaps a push-only design leaves open:
@@ -18,9 +23,10 @@ a task is resolved exactly once, whichever path gets there first.
 
 Layout
 ------
-  ~/.hermes/pi-bridge/state.db     task state
-  ~/.hermes/pi-bridge/tasks/       one prompt file per task
-  ~/.hermes/pi-bridge/logs/        per-task stdout/stderr
+  $PI_BRIDGE_STATE_DIR/state.db    task state
+  $PI_BRIDGE_STATE_DIR/tasks/      one prompt file per task
+  $PI_BRIDGE_STATE_DIR/logs/       per-task stdout/stderr
+State defaults to $XDG_STATE_HOME/pi-bridge (~/.local/state/pi-bridge).
 
 Usage
 -----
@@ -54,7 +60,12 @@ from pathlib import Path
 # ---------------------------------------------------------------- config
 
 HOME = Path.home()
-BRIDGE_DIR = Path(os.environ.get("PI_BRIDGE_DIR", HOME / ".hermes" / "pi-bridge"))
+_XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
+BRIDGE_DIR = Path(
+    os.environ.get("PI_BRIDGE_STATE_DIR")
+    or os.environ.get("PI_BRIDGE_DIR")
+    or _XDG_STATE / "pi-bridge"
+)
 TASKS_DIR = BRIDGE_DIR / "tasks"
 LOGS_DIR = BRIDGE_DIR / "logs"
 DB_PATH = BRIDGE_DIR / "state.db"
@@ -65,15 +76,16 @@ CALLBACK_PATH = "/callback"
 
 # ---------------------------------------------------------------- wake layer
 
-# Optional: notify Hermes (or anything HTTP) that a task reached a terminal
-# state, so an idle orchestrator can be woken instead of polled. Entirely
-# additive - if this is unconfigured or fails, task resolution is unaffected.
-HERMES_WEBHOOK_URL = os.environ.get("PI_BRIDGE_WAKE_URL", "")
-HERMES_WEBHOOK_SECRET = os.environ.get("PI_BRIDGE_WAKE_SECRET", "")
+# Optional: POST a signed JSON notification to an HTTP endpoint when a task
+# reaches a terminal state, so an idle orchestrator can be woken instead of
+# polled. Entirely additive - if unconfigured or failing, task resolution is
+# unaffected.
+NOTIFY_URL = os.environ.get("PI_BRIDGE_NOTIFY_URL", "")
+NOTIFY_SECRET = os.environ.get("PI_BRIDGE_NOTIFY_SECRET", "")
 
-# Optional: periodic progress heartbeat. A separate route from the completion
-# wake, delivered with deliver_only so it costs no agent run. Unset -> silent.
-HERMES_STATUS_URL = os.environ.get("PI_BRIDGE_STATUS_URL", "")
+# Optional: periodic progress heartbeat, posted to its own endpoint so a long run
+# is never silent. Unset -> no heartbeat.
+HEARTBEAT_URL = os.environ.get("PI_BRIDGE_HEARTBEAT_URL", "")
 HEARTBEAT_INTERVAL = int(os.environ.get("PI_BRIDGE_HEARTBEAT_INTERVAL", "60"))
 
 
@@ -101,9 +113,9 @@ def _post_signed(url: str, payload: dict, event: str) -> None:
     try:
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        if HERMES_WEBHOOK_SECRET:
+        if NOTIFY_SECRET:
             sig = hmac.new(
-                HERMES_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
+                NOTIFY_SECRET.encode("utf-8"), body, hashlib.sha256
             ).hexdigest()
             # GitHub-style headers, which is what the Hermes webhook platform verifies.
             headers["X-Hub-Signature-256"] = f"sha256={sig}"
@@ -121,7 +133,7 @@ def _post_signed(url: str, payload: dict, event: str) -> None:
 
 def _post_wake(payload: dict) -> None:
     """POST the wake payload. Never raises into the caller."""
-    _post_signed(HERMES_WEBHOOK_URL, payload, "pi-task")
+    _post_signed(NOTIFY_URL, payload, "pi-task")
 
 
 def wake_async(task_id: str) -> None:
@@ -132,7 +144,7 @@ def wake_async(task_id: str) -> None:
     called, so a slow or dead webhook endpoint must not block the bridge, hold a
     request thread, or delay any other task. Failures are logged and dropped.
     """
-    if not HERMES_WEBHOOK_URL:
+    if not NOTIFY_URL:
         return
 
     def _run() -> None:
@@ -152,16 +164,34 @@ def wake_async(task_id: str) -> None:
     threading.Thread(target=_run, daemon=True, name=f"wake-{task_id}").start()
 
 
-# ---------------------------------------------------------------- hermes model
+# ---------------------------------------------------------------- orchestrator
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
-HERMES_STATE_DB = HERMES_HOME / "state.db"
-HERMES_CONFIG = HERMES_HOME / "config.yaml"
+# Optional orchestrator integration. Point these at the orchestrator's own state
+# and the bridge can (a) inherit the model it is currently using and (b) attach
+# routing context to notifications. Both are opt-in: leave them unset and the
+# bridge is a plain task runner with no knowledge of the caller.
+ORCHESTRATOR_DB = (
+    Path(os.environ["PI_BRIDGE_ORCHESTRATOR_DB"])
+    if os.environ.get("PI_BRIDGE_ORCHESTRATOR_DB")
+    else None
+)
+ORCHESTRATOR_CONFIG = (
+    Path(os.environ["PI_BRIDGE_ORCHESTRATOR_CONFIG"])
+    if os.environ.get("PI_BRIDGE_ORCHESTRATOR_CONFIG")
+    else None
+)
 
-# Models that are internal aliases, not real model ids the gateway will accept.
-# `hermes` is an alias that routes to whatever the gateway's default is; using it
-# as a Pi model id would silently pin Pi to a different model than Hermes.
-_ALIAS_PREFIXES = ("hermes", "main-agent", "code-reviewer", "lightweight", "paid-models")
+# Model ids that are internal routing aliases rather than real models the gateway
+# accepts. Pinning Pi to one silently pins it to whatever the gateway default is,
+# so these are skipped whenever a concrete model is available.
+_ALIAS_PREFIXES = tuple(
+    a.strip()
+    for a in os.environ.get(
+        "PI_BRIDGE_MODEL_ALIASES",
+        "hermes,main-agent,code-reviewer,lightweight,paid-models",
+    ).split(",")
+    if a.strip()
+)
 
 
 def _looks_like_alias(model: str) -> bool:
@@ -177,10 +207,10 @@ def active_model_from_state(session_id: str | None = None) -> tuple[str | None, 
     `sessions.model`, so 'the model Hermes is using right now' is a session-scoped
     question - not a single global value.
     """
-    if not HERMES_STATE_DB.is_file():
+    if not ORCHESTRATOR_DB or not ORCHESTRATOR_DB.is_file():
         return (None, None)
     try:
-        conn = sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(f"file:{ORCHESTRATOR_DB}?mode=ro", uri=True, timeout=10)
     except sqlite3.Error:
         return (None, None)
     try:
@@ -211,10 +241,10 @@ def active_session_origin(session_id: str | None = None) -> tuple[str | None, st
     Returns (session_id, chat_id, thread_id) of the active Hermes session.
     Used to route wake notifications directly back to the requesting chat and topic.
     """
-    if not HERMES_STATE_DB.is_file():
+    if not ORCHESTRATOR_DB or not ORCHESTRATOR_DB.is_file():
         return (None, None, None)
     try:
-        conn = sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(f"file:{ORCHESTRATOR_DB}?mode=ro", uri=True, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             if session_id:
@@ -265,18 +295,18 @@ def _read_log_error(log_path_str: str | None) -> str | None:
 
 def config_default_model() -> str | None:
     """Fallback: the configured default model in config.yaml."""
-    if not HERMES_CONFIG.is_file():
+    if not ORCHESTRATOR_CONFIG or not ORCHESTRATOR_CONFIG.is_file():
         return None
     try:
         import yaml  # optional dependency
-        with HERMES_CONFIG.open(encoding="utf-8") as fh:
+        with ORCHESTRATOR_CONFIG.open(encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh) or {}
         m = (cfg.get("model") or {}).get("default")
         return m or None
     except Exception:
         # Minimal fallback that does not require pyyaml.
         try:
-            text = HERMES_CONFIG.read_text(encoding="utf-8")
+            text = ORCHESTRATOR_CONFIG.read_text(encoding="utf-8")
         except OSError:
             return None
         m = re.search(r"^model:\s*\n\s+default:\s*(\S+)", text, re.M)
@@ -289,7 +319,7 @@ def resolve_model(explicit: str | None = None, session_id: str | None = None,
     Decide which model Pi should run. Returns (model, source).
 
     Order:
-      1. explicit override (--model / HERMES_PI_MODEL)
+      1. explicit override (--model / PI_BRIDGE_MODEL)
       2. the model Hermes is currently using (live session)
       3. config.yaml default
       4. 'hermes' (gateway alias)
@@ -300,24 +330,24 @@ def resolve_model(explicit: str | None = None, session_id: str | None = None,
     if explicit:
         return (explicit, "explicit")
 
-    env_override = os.environ.get("HERMES_PI_MODEL")
+    env_override = os.environ.get("PI_BRIDGE_MODEL")
     if env_override:
         return (env_override, "env")
 
     model, _ = active_model_from_state(session_id)
     if model and (allow_alias or not _looks_like_alias(model)):
-        return (model, "hermes-session")
+        return (model, "session")
     if model:
         # Only an alias was found; prefer a concrete configured default.
         cfg = config_default_model()
         if cfg and not _looks_like_alias(cfg):
-            return (cfg, "hermes-config")
-        return (model, "hermes-session-alias")
+            return (cfg, "config")
+        return (model, "session-alias")
 
     cfg = config_default_model()
     if cfg:
-        return (cfg, "hermes-config")
-    return ("hermes", "fallback")
+        return (cfg, "config")
+    return (FALLBACK_MODEL, "fallback")
 
 
 # Where Pi keeps sessions. Pi groups by working directory.
@@ -329,6 +359,9 @@ DEFAULT_TIMEOUT = int(os.environ.get("PI_BRIDGE_TIMEOUT", "7200"))  # 2h
 WATCHDOG_INTERVAL = int(os.environ.get("PI_BRIDGE_WATCHDOG_INTERVAL", "30"))
 
 PI_BIN = os.environ.get("PI_BIN", "pi")
+# Model to use when nothing else resolves. Gateway routing aliases are the usual
+# reason to set this.
+FALLBACK_MODEL = os.environ.get("PI_BRIDGE_FALLBACK_MODEL", "hermes")
 
 # Terminal statuses. Anything else means "still in flight".
 FINAL = {"done", "failed", "timeout", "lost"}
@@ -355,7 +388,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     resolution    TEXT,                   -- callback|session-file|watchdog|exit
     resolved_by   TEXT,                   -- who first resolved it
     log_path      TEXT,
-    model_source  TEXT,                   -- explicit|env|hermes-session|hermes-config|fallback
+    model_source  TEXT,                   -- explicit|env|session|config|fallback
     origin_chat_id   TEXT,
     origin_thread_id TEXT
 );
@@ -644,6 +677,13 @@ def handle_callback(payload: dict) -> bool:
 # ---------------------------------------------------------------- submission
 
 
+_PASSTHROUGH_PROVIDERS = tuple(
+    p.strip()
+    for p in os.environ.get("PI_BRIDGE_PASSTHROUGH_PROVIDERS", "local").split(",")
+    if p.strip()
+)
+
+
 def ensure_provider_placeholder() -> None:
     """
     Guarantee Pi has at least one declared model for the gateway provider.
@@ -651,9 +691,9 @@ def ensure_provider_placeholder() -> None:
     Pi refuses a provider that declares zero models ("Unknown provider"), but it
     happily passes an *undeclared* model id through to the server
     ("Using custom model id"). Declaring one placeholder therefore unlocks
-    arbitrary model ids - which is what lets Hermes inject the model it is
-    currently using without hardcoding a model list that the 1200-entry gateway
-    catalog would invalidate anyway.
+    arbitrary model ids - which is what lets an orchestrator inject the model it
+    is currently using without hardcoding a model list that the gateway catalog
+    would invalidate anyway.
     """
     models_json = HOME / ".pi" / "agent" / "models.json"
     if not models_json.is_file():
@@ -670,7 +710,9 @@ def ensure_provider_placeholder() -> None:
         models = prov.get("models")
         if not models:  # empty or missing -> Pi rejects the whole provider
             base = (prov.get("baseUrl") or "")
-            if "8080" in base or name == "local":
+            if name in _PASSTHROUGH_PROVIDERS or any(
+                p and p in base for p in _PASSTHROUGH_PROVIDERS
+            ):
                 prov["models"] = [{
                     "id": "hermes", "name": "Passthrough (Hermes)",
                     "reasoning": True, "contextWindow": 131072, "maxTokens": 32768,
@@ -685,8 +727,8 @@ def ensure_provider_placeholder() -> None:
 
 def build_env(task_id: str) -> dict:
     env = os.environ.copy()
-    env["HERMES_CALLBACK_URL"] = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
-    env["HERMES_TASK_ID"] = task_id
+    env["PI_BRIDGE_CALLBACK_URL"] = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
+    env["PI_BRIDGE_TASK_ID"] = task_id
     return env
 
 
@@ -699,7 +741,7 @@ def submit(
     timeout: int = DEFAULT_TIMEOUT,
     extra_args: list[str] | None = None,
     use_systemd: bool = False,
-    hermes_session_id: str | None = None,
+    session: str | None = None,
     allow_alias: bool = False,
 ) -> str:
     """
@@ -717,7 +759,7 @@ def submit(
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     chosen_model, model_source = resolve_model(
-        model, session_id=hermes_session_id, allow_alias=allow_alias
+        model, session_id=session, allow_alias=allow_alias
     )
     ensure_provider_placeholder()
 
@@ -739,8 +781,8 @@ def submit(
             "systemd-run", "--user", f"--unit={unit}",
             "--property=Type=oneshot",
             f"--working-directory={cwd}",
-            f"--setenv=HERMES_CALLBACK_URL={os.environ.get('HERMES_CALLBACK_URL') or f'http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}'}",
-            f"--setenv=HERMES_TASK_ID={task_id}",
+            f"--setenv=PI_BRIDGE_CALLBACK_URL={os.environ.get('PI_BRIDGE_CALLBACK_URL') or f'http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}'}",
+            f"--setenv=PI_BRIDGE_TASK_ID={task_id}",
             *args,
         ]
         with log_path.open("wb") as log:
@@ -761,7 +803,7 @@ def submit(
         pid = proc.pid
 
     now = time.time()
-    _, origin_chat, origin_thread = active_session_origin(hermes_session_id)
+    _, origin_chat, origin_thread = active_session_origin(session)
     origin_chat = origin_chat or "1274076905"
     origin_thread = origin_thread or "3482164"
 
@@ -954,7 +996,7 @@ def heartbeat_loop(stop: threading.Event) -> None:
             for row in rows:
                 payload = task_status(row)
                 payload["delivery_id"] = f"{row['task_id']}-hb-{int(time.time())}"
-                _post_signed(HERMES_STATUS_URL, payload, "pi-status")
+                _post_signed(HEARTBEAT_URL, payload, "pi-status")
         except Exception as exc:  # never let the heartbeat die
             print(f"[heartbeat] error: {exc}", flush=True)
 
@@ -991,7 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
                 model=payload.get("model"),
                 provider=payload.get("provider"),
                 timeout=int(payload.get("timeout", DEFAULT_TIMEOUT)),
-                hermes_session_id=payload.get("hermes_session_id"),
+                session=payload.get("session_id"),
                 allow_alias=bool(payload.get("allow_alias", False)),
             )
             return self._json(200, {"ok": True, "task_id": tid})
@@ -999,7 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/model":
             model, source = resolve_model(
                 payload.get("explicit"),
-                session_id=payload.get("hermes_session_id"),
+                session_id=payload.get("session_id"),
                 allow_alias=bool(payload.get("allow_alias", False)),
             )
             return self._json(200, {"ok": True, "model": model, "source": source})
@@ -1047,9 +1089,9 @@ def serve() -> None:
 
     stop = threading.Event()
     threading.Thread(target=watchdog_loop, args=(stop,), daemon=True).start()
-    if HERMES_STATUS_URL:
+    if HEARTBEAT_URL:
         threading.Thread(target=heartbeat_loop, args=(stop,), daemon=True).start()
-        print(f"[serve] heartbeat every {HEARTBEAT_INTERVAL}s -> {HERMES_STATUS_URL}", flush=True)
+        print(f"[serve] heartbeat every {HEARTBEAT_INTERVAL}s -> {HEARTBEAT_URL}", flush=True)
 
     httpd = ThreadingHTTPServer((CALLBACK_HOST, CALLBACK_PORT), Handler)
     print(f"[serve] callback  http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}", flush=True)
@@ -1080,7 +1122,7 @@ def main() -> int:
     s.add_argument("--provider")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     s.add_argument("--systemd", action="store_true", help="run as a user systemd unit")
-    s.add_argument("--hermes-session", help="Hermes session id to inherit the model from")
+    s.add_argument("--session", help="Hermes session id to inherit the model from")
     s.add_argument("--allow-alias", action="store_true",
                    help="allow internal alias models like 'hermes'")
 
@@ -1089,7 +1131,7 @@ def main() -> int:
 
     m = sub.add_parser("model", help="show which model Pi would use, and why")
     m.add_argument("--explicit")
-    m.add_argument("--hermes-session")
+    m.add_argument("--session")
     m.add_argument("--allow-alias", action="store_true")
 
     pr = sub.add_parser("probe", help="print the heartbeat status for a task, without waiting")
@@ -1106,14 +1148,14 @@ def main() -> int:
         return 0
 
     if a.cmd == "model":
-        model, source = resolve_model(a.explicit, session_id=a.hermes_session,
+        model, source = resolve_model(a.explicit, session_id=a.session,
                                       allow_alias=a.allow_alias)
-        live, _ = active_model_from_state(a.hermes_session)
+        live, _ = active_model_from_state(a.session)
         print(json.dumps({
             "resolved_model": model,
             "source": source,
-            "hermes_active_model": live,
-            "hermes_config_default": config_default_model(),
+            "active_model": live,
+            "config_default": config_default_model(),
             "looks_like_alias": _looks_like_alias(model),
         }, indent=2))
         return 0
@@ -1121,7 +1163,7 @@ def main() -> int:
     if a.cmd == "submit":
         tid = submit(a.prompt, a.cwd, model=a.model, provider=a.provider,
                      timeout=a.timeout, use_systemd=a.systemd,
-                     hermes_session_id=a.hermes_session, allow_alias=a.allow_alias)
+                     session=a.session, allow_alias=a.allow_alias)
         print(tid)
         return 0
 
