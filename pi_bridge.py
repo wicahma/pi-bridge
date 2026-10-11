@@ -216,7 +216,7 @@ _ALIAS_PREFIXES = tuple(
     a.strip()
     for a in os.environ.get(
         "PI_BRIDGE_MODEL_ALIASES",
-        "hermes,main-agent,code-reviewer,lightweight,paid-models",
+        "",
     ).split(",")
     if a.strip()
 )
@@ -354,7 +354,7 @@ def resolve_model(explicit: str | None = None, session_id: str | None = None,
       1. explicit override (--model / PI_BRIDGE_MODEL)
       2. the model Hermes is currently using (live session)
       3. config.yaml default
-      4. 'hermes' (gateway alias)
+      4. PI_BRIDGE_FALLBACK_MODEL, when set
 
     Internal aliases are skipped when a concrete model is available, because
     pinning Pi to an alias does not guarantee it follows Hermes.
@@ -391,9 +391,9 @@ DEFAULT_TIMEOUT = int(os.environ.get("PI_BRIDGE_TIMEOUT", "7200"))  # 2h
 WATCHDOG_INTERVAL = int(os.environ.get("PI_BRIDGE_WATCHDOG_INTERVAL", "30"))
 
 PI_BIN = os.environ.get("PI_BIN", "pi")
-# Model to use when nothing else resolves. Gateway routing aliases are the usual
-# reason to set this.
-FALLBACK_MODEL = os.environ.get("PI_BRIDGE_FALLBACK_MODEL", "hermes")
+# Model to use when nothing else resolves (e.g. a gateway routing alias).
+# Empty means: do not pass --model, let Pi use its own configured default.
+FALLBACK_MODEL = os.environ.get("PI_BRIDGE_FALLBACK_MODEL", "")
 
 # Terminal statuses. Anything else means "still in flight".
 FINAL = {"done", "failed", "timeout", "lost"}
@@ -715,7 +715,7 @@ def handle_callback(payload: dict) -> bool:
 
 _PASSTHROUGH_PROVIDERS = tuple(
     p.strip()
-    for p in os.environ.get("PI_BRIDGE_PASSTHROUGH_PROVIDERS", "local").split(",")
+    for p in os.environ.get("PI_BRIDGE_PASSTHROUGH_PROVIDERS", "").split(",")
     if p.strip()
 )
 
@@ -752,7 +752,7 @@ def ensure_provider_placeholder() -> None:
                 p and p in base for p in _PASSTHROUGH_PROVIDERS
             ):
                 prov["models"] = [{
-                    "id": "hermes", "name": "Passthrough (Hermes)",
+                    "id": "passthrough", "name": "Passthrough",
                     "reasoning": True, "contextWindow": 131072, "maxTokens": 32768,
                 }]
                 changed = True
@@ -807,7 +807,7 @@ def fit_model_to_pi(model: str, provider: str | None) -> tuple[str, str | None, 
     `note` is None when nothing changed, "provider" when the passthrough provider
     was attached, "model" when the model fell back to FALLBACK_MODEL.
     """
-    if model_is_resolvable(model, provider):
+    if not model or model_is_resolvable(model, provider):
         return model, provider, None
     if not provider:
         passthrough = passthrough_provider()
@@ -861,8 +861,9 @@ def submit(
     prompt_file.write_text(prompt, encoding="utf-8")
     log_path = LOGS_DIR / f"{task_id}.log"
 
-    args = [PI_BIN, "-p", prompt, "--session-id", session_id, "--approve",
-            "--model", chosen_model]
+    args = [PI_BIN, "-p", prompt, "--session-id", session_id, "--approve"]
+    if chosen_model:
+        args += ["--model", chosen_model]
     if provider:
         args += ["--provider", provider]
     if extra_args:

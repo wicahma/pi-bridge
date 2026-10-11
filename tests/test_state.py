@@ -162,6 +162,7 @@ def test_resolve_model_falls_back(monkeypatch):
 
 def test_resolve_model_skips_alias_when_a_concrete_default_exists(monkeypatch):
     monkeypatch.delenv("PI_BRIDGE_MODEL", raising=False)
+    monkeypatch.setattr(b, "_ALIAS_PREFIXES", ("hermes",))
     monkeypatch.setattr(b, "active_model_from_state", lambda _s=None: ("hermes", None))
     monkeypatch.setattr(b, "config_default_model", lambda: "real-model")
     assert b.resolve_model() == ("real-model", "config")
@@ -169,12 +170,14 @@ def test_resolve_model_skips_alias_when_a_concrete_default_exists(monkeypatch):
 
 def test_resolve_model_uses_alias_when_nothing_else(monkeypatch):
     monkeypatch.delenv("PI_BRIDGE_MODEL", raising=False)
+    monkeypatch.setattr(b, "_ALIAS_PREFIXES", ("hermes",))
     monkeypatch.setattr(b, "active_model_from_state", lambda _s=None: ("hermes", None))
     monkeypatch.setattr(b, "config_default_model", lambda: None)
     assert b.resolve_model() == ("hermes", "session-alias")
 
 
-def test_looks_like_alias():
+def test_looks_like_alias(monkeypatch):
+    monkeypatch.setattr(b, "_ALIAS_PREFIXES", ("hermes", "code-reviewer"))
     assert b._looks_like_alias("hermes")
     assert b._looks_like_alias("code-reviewer")
     assert not b._looks_like_alias("gpt-4o-mini")
