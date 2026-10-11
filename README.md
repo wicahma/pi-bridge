@@ -197,6 +197,10 @@ The engine has no orchestrator-specific code. An integration only has to:
   `/pi_*` slash commands, a Pi extension that calls back on settle, two webhook
   route definitions (one mirrored into the session, one `deliver_only`), and the
   systemd unit.
+- **Anything with HTTP + HMAC** — see
+  [`integrations/generic/`](integrations/generic/README.md): a small stdlib-only
+  orchestrator that submits a task and verifies the signed callback. Point the
+  bridge's `PI_BRIDGE_NOTIFY_URL` at it.
 
 ### Planned / candidate
 
@@ -211,7 +215,6 @@ work. Listed as a roadmap, not as shipped support.
 | ACP clients (Zed, JetBrains, Neovim, Emacs) | editor-integrated agents | ACP adapter: prompt → `/submit`, callback → session update |
 | n8n and similar workflow engines | automation | HTTP Request node → `/submit`; Webhook node ← signed callback |
 | CI (GitHub Actions, Woodpecker, …) | pipelines | a step that `POST`s `/submit` and polls `/status/<id>` |
-| Anything with HTTP + HMAC | generic | the three requirements above |
 
 ## Security
 
