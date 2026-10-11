@@ -714,6 +714,8 @@ _PASSTHROUGH_PROVIDERS = tuple(
 )
 
 
+PI_MODELS_JSON = HOME / ".pi" / "agent" / "models.json"
+
 def ensure_provider_placeholder() -> None:
     """
     Guarantee Pi has at least one declared model for the gateway provider.
@@ -725,7 +727,7 @@ def ensure_provider_placeholder() -> None:
     is currently using without hardcoding a model list that the gateway catalog
     would invalidate anyway.
     """
-    models_json = HOME / ".pi" / "agent" / "models.json"
+    models_json = PI_MODELS_JSON
     if not models_json.is_file():
         return
     try:
@@ -754,6 +756,58 @@ def ensure_provider_placeholder() -> None:
         except OSError:
             pass
 
+
+def declared_models() -> dict[str, set[str]]:
+    """
+    Map provider name -> declared model ids, read from Pi's models.json.
+    Empty dict means the catalog is unknown (missing or unreadable file), in
+    which case callers must not assume a model is unusable.
+    """
+    try:
+        cfg = json.loads(PI_MODELS_JSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, set[str]] = {}
+    for name, prov in (cfg.get("providers") or {}).items():
+        if isinstance(prov, dict):
+            out[name] = {
+                m.get("id") for m in (prov.get("models") or [])
+                if isinstance(m, dict) and m.get("id")
+            }
+    return out
+
+def passthrough_provider() -> str | None:
+    """First configured passthrough provider that Pi will accept, if any."""
+    declared = declared_models()
+    return next((p for p in _PASSTHROUGH_PROVIDERS if declared.get(p)), None)
+
+def model_is_resolvable(model: str, provider: str | None) -> bool:
+    """
+    Whether Pi can resolve `model` given an optional explicit provider.
+    With an explicit provider, Pi passes any undeclared id through to the server
+    as long as that provider declares at least one model. Without one, the id
+    must appear in the declared catalog.
+    """
+    declared = declared_models()
+    if not declared:
+        return True
+    if provider:
+        return bool(declared.get(provider))
+    return any(model in ids for ids in declared.values())
+
+def fit_model_to_pi(model: str, provider: str | None) -> tuple[str, str | None, str | None]:
+    """
+    Return (model, provider, note) adjusted so Pi can actually start.
+    `note` is None when nothing changed, "provider" when the passthrough provider
+    was attached, "model" when the model fell back to FALLBACK_MODEL.
+    """
+    if model_is_resolvable(model, provider):
+        return model, provider, None
+    if not provider:
+        passthrough = passthrough_provider()
+        if passthrough:
+            return model, passthrough, "provider"
+    return FALLBACK_MODEL, provider, "model"
 
 def build_env(task_id: str) -> dict:
     env = os.environ.copy()
@@ -793,6 +847,9 @@ def submit(
         model, session_id=session, allow_alias=allow_alias
     )
     ensure_provider_placeholder()
+    chosen_model, provider, model_note = fit_model_to_pi(chosen_model, provider)
+    if model_note:
+        model_source = model_note
 
     prompt_file = TASKS_DIR / f"{task_id}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
