@@ -3,6 +3,9 @@ Description=Pi bridge - task runner, signed push callbacks, watchdog, heartbeat
 Documentation=https://github.com/wicahma/pi-bridge/blob/main/docs/PROTOCOL.md
 After=network.target
 
+# Do not let a crash loop take the machine down.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/state/pi-bridge
@@ -34,9 +37,6 @@ Environment=PI_BRIDGE_ORCHESTRATOR_CONFIG=%h/.hermes/config.yaml
 # were lost while it was down, so a restart is safe.
 Restart=always
 RestartSec=5
-
-# Do not let a crash loop take the machine down.
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=default.target
