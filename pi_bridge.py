@@ -846,6 +846,25 @@ def fit_model_to_pi(model: str, provider: str | None) -> tuple[str, str | None, 
             return model, passthrough, "provider"
     return FALLBACK_MODEL, provider, "model"
 
+HOOKS_DIR = Path(__file__).resolve().parent / "git-hooks"
+
+def no_commit_env() -> dict[str, str]:
+    """
+    Environment that makes git refuse to commit or push, for one Pi process.
+
+    Git reads GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n as extra
+    config, so core.hooksPath points at the bridge's blocking hooks without
+    touching the target repo or replacing the user's global config.
+    """
+    base = int(os.environ.get("GIT_CONFIG_COUNT") or "0")
+    return {
+        "PI_BRIDGE_NO_COMMIT": "1",
+        "GIT_CONFIG_COUNT": str(base + 1),
+        f"GIT_CONFIG_KEY_{base}": "core.hooksPath",
+        f"GIT_CONFIG_VALUE_{base}": str(HOOKS_DIR),
+    }
+
+
 def build_env(task_id: str) -> dict:
     env = os.environ.copy()
     env["PI_BRIDGE_CALLBACK_URL"] = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
@@ -865,6 +884,7 @@ def submit(
     session: str | None = None,
     allow_alias: bool = False,
     context: dict | None = None,
+    no_commit: bool = False,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -894,6 +914,7 @@ def submit(
     prompt_file.write_text(prompt, encoding="utf-8")
     log_path = LOGS_DIR / f"{task_id}.log"
 
+    block_env = no_commit_env() if no_commit else {}
     args = [PI_BIN, "-p", prompt, "--session-id", session_id, "--approve"]
     if chosen_model:
         args += ["--model", chosen_model]
@@ -911,6 +932,7 @@ def submit(
             f"--working-directory={cwd}",
             f"--setenv=PI_BRIDGE_CALLBACK_URL={os.environ.get('PI_BRIDGE_CALLBACK_URL') or f'http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}'}",
             f"--setenv=PI_BRIDGE_TASK_ID={task_id}",
+            *[f"--setenv={k}={v}" for k, v in block_env.items()],
             *args,
         ]
         with log_path.open("wb") as log:
@@ -925,7 +947,7 @@ def submit(
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 cwd=cwd,
-                env=build_env(task_id),
+                env={**build_env(task_id), **block_env},
                 start_new_session=True,  # detach: survives the caller exiting
             )
         pid = proc.pid
@@ -1187,6 +1209,7 @@ class Handler(BaseHTTPRequestHandler):
                 session=payload.get("session_id"),
                 allow_alias=bool(payload.get("allow_alias", False)),
                 context=payload.get("context"),
+                no_commit=bool(payload.get("no_commit", False)),
             )
             return self._json(200, {"ok": True, "task_id": tid})
 
@@ -1279,6 +1302,8 @@ def main() -> int:
                                      "(or $HERMES_SESSION_ID)")
     s.add_argument("--allow-alias", action="store_true",
                    help="allow internal alias models like 'hermes'")
+    s.add_argument("--no-commit", action="store_true",
+                   help="forbid this task from committing or pushing (enforced by git hooks)")
     s.add_argument("--context", help="opaque JSON object echoed in every notification")
 
     st = sub.add_parser("status")
@@ -1323,7 +1348,8 @@ def main() -> int:
             return 2
         tid = submit(a.prompt, a.cwd, model=a.model, provider=a.provider,
                      timeout=a.timeout, use_systemd=a.systemd,
-                     session=a.session, allow_alias=a.allow_alias, context=ctx)
+                     session=a.session, allow_alias=a.allow_alias, context=ctx,
+                     no_commit=a.no_commit)
         print(tid)
         return 0
 

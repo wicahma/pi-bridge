@@ -105,7 +105,7 @@ curl -s localhost:8799/list
 | Command | Purpose |
 | --- | --- |
 | `serve` | run the HTTP API, watchdog and heartbeat |
-| `submit "<prompt>" [--cwd DIR] [--model M] [--provider P] [--timeout S] [--session ID] [--context JSON] [--systemd]` | dispatch a task, print its id |
+| `submit "<prompt>" [--cwd DIR] [--model M] [--provider P] [--timeout S] [--session ID] [--context JSON] [--no-commit] [--systemd]` | dispatch a task, print its id |
 | `status <id>` | current row from `state.db` |
 | `model [--explicit M] [--session ID]` | show which model Pi would use, and why |
 | `probe <id>` | classify a running task from its session file, without waiting |
@@ -126,6 +126,12 @@ curl -s localhost:8799/list
 `context` is an arbitrary JSON object, stored verbatim and echoed back in every
 notification for that task. That is the entire integration surface: the bridge
 never interprets it.
+
+`--no-commit` (HTTP: `no_commit`) makes the task unable to commit or push. The bridge
+points `core.hooksPath` at its own `git-hooks/` for that Pi process through
+`GIT_CONFIG_*`, so git itself refuses: a prompt cannot talk Pi out of it, the target
+repo is not modified, and the user's global git config is not replaced. The hooks are
+only reachable when the flag is set, so a repo's own hooks are never shadowed.
 
 ## Configuration
 

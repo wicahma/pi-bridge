@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ -n "$PI_BRIDGE_NO_COMMIT" ]; then
+  echo "pi-bridge: task submitted with --no-commit; refusing to push" >&2
+  exit 1
+fi
+exit 0
