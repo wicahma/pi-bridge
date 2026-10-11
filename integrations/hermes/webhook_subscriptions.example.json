@@ -1,0 +1,31 @@
+{
+  "pi-done": {
+    "description": "Wake Hermes when a delegated Pi coding task completes",
+    "events": [],
+    "secret": "REPLACE_WITH_YOUR_WEBHOOK_SECRET",
+    "prompt": "Pi coding task {task_id} finished. status={status} cwd={cwd} model={model}. Pi reported: {result_text}\n\nDo this now: verify the result yourself before telling anyone it worked. Read the files Pi claims it changed, and run the relevant test or build command. Pi's own summary is a self-report, never evidence. If verification fails, re-delegate via the pi-bridge with the failure included. Then reply to the user in one or two lines: what changed, what you verified, and anything still broken.",
+    "skills": [],
+    "deliver": "telegram",
+    "profile": "default",
+    "created_at": "2026-10-09T16:06:49Z",
+    "deliver_extra": {
+      "chat_id": "{chat_id}",
+      "thread_id": "{thread_id}"
+    },
+    "mirror_to_session": true
+  },
+  "pi-status": {
+    "description": "Live status heartbeat from the Pi bridge (direct delivery, no agent run)",
+    "events": [],
+    "secret": "REPLACE_WITH_YOUR_WEBHOOK_SECRET",
+    "prompt": "\u23f3 pi `{task_id}` {state}\n{elapsed} \u00b7 iter {iteration} \u00b7 tool {last_tool}\n{detail}",
+    "skills": [],
+    "deliver": "telegram",
+    "profile": "default",
+    "deliver_extra": {
+      "chat_id": "{chat_id}",
+      "thread_id": "{thread_id}"
+    },
+    "deliver_only": true
+  }
+}

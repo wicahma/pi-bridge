@@ -1,0 +1,30 @@
+[Unit]
+Description=Pi bridge - callback receiver + watchdog for Pi coding-agent tasks
+Documentation=file:///home/user/.hermes/pi-bridge/pi_bridge.py
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/.hermes/pi-bridge
+ExecStart=/usr/bin/python3 /home/user/.hermes/pi-bridge/pi_bridge.py serve
+Environment=PI_BRIDGE_WATCHDOG_INTERVAL=30
+Environment=PI_BRIDGE_PORT=8799
+# Wake layer: POST to the Hermes webhook route when a task reaches a terminal
+# state, so an idle orchestrator can be woken instead of polled. Optional - if
+# the URL is unset the bridge behaves exactly as before.
+Environment=PI_BRIDGE_WAKE_URL=http://127.0.0.1:8644/webhooks/pi-done
+Environment=PI_BRIDGE_WAKE_SECRET=REPLACE_WITH_YOUR_WEBHOOK_SECRET
+Environment=PI_BRIDGE_STATUS_URL=http://127.0.0.1:8644/webhooks/pi-status
+Environment=PI_BRIDGE_HEARTBEAT_INTERVAL=60
+
+# Restart on any failure: this process owns task state, so it must come back on
+# its own. reconcile() runs on every start and re-resolves tasks whose callbacks
+# were lost while it was down, so a restart is safe.
+Restart=always
+RestartSec=5
+
+# Do not let a crash loop take the machine down.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target

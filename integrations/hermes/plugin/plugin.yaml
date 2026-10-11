@@ -1,0 +1,5 @@
+name: pi-bridge
+version: 1.0.0
+description: "Slash commands for the Pi coding-agent bridge: inspect tasks, control the model Pi runs with, and manage the wake layer."
+author: "Hermes (generated)"
+provides_hooks: []
