@@ -416,6 +416,9 @@ PI_SESSIONS_DIR = Path(
 
 DEFAULT_TIMEOUT = int(os.environ.get("PI_BRIDGE_TIMEOUT", "7200"))  # 2h
 WATCHDOG_INTERVAL = int(os.environ.get("PI_BRIDGE_WATCHDOG_INTERVAL", "30"))
+# An orphan is a Pi process whose task has no running row. Only reap one that has
+# gone this long without writing to its session file.
+ORPHAN_IDLE = int(os.environ.get("PI_BRIDGE_ORPHAN_IDLE", "900"))
 
 PI_BIN = os.environ.get("PI_BIN", "pi")
 # Model to use when nothing else resolves (e.g. a gateway routing alias).
@@ -1127,12 +1130,98 @@ def reconcile() -> list[str]:
             changed.append(tid)
     return changed
 
+# ---------------------------------------------------------------- reaper
+
+def _proc_env(pid: int) -> dict[str, str]:
+    """Read a process environment. Empty dict when /proc/<pid>/environ is unreadable."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for chunk in raw.split(b"\0"):
+        if not chunk:
+            continue
+        key, _, val = chunk.partition(b"=")
+        out[key.decode("utf-8", "replace")] = val.decode("utf-8", "replace")
+    return out
+
+def _proc_argv0(pid: int) -> str:
+    """First element of a process argv. Empty string when unreadable."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.split(b"\0")[0].decode("utf-8", "replace")
+
+def _proc_cwd(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+def iter_pi_procs() -> list[tuple[int, str, str]]:
+    """(pid, task_id, cwd) for every live bridge-spawned Pi process."""
+    found: list[tuple[int, str, str]] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if Path(_proc_argv0(pid)).name != "pi":
+            continue
+        task_id = _proc_env(pid).get("PI_BRIDGE_TASK_ID")
+        cwd = _proc_cwd(pid)
+        if task_id and cwd:
+            found.append((pid, task_id, cwd))
+    return found
+
+def reap_orphans() -> list[int]:
+    """SIGTERM Pi processes whose task has no running row and that have gone idle.
+
+    A process is only reaped when all three gates hold: it is a bridge-spawned
+    `pi` (PI_BRIDGE_TASK_ID present), its task_id has no `running` row, and its
+    session file exists but has not been written for ORPHAN_IDLE seconds. The
+    session-file gate is what makes this safe against the spawn/insert race:
+    submit() Popen()s Pi before INSERTing the row, so a just-started process has
+    no row yet but also has no session file yet, and is skipped.
+    """
+    conn = db()
+    try:
+        running = {
+            row["task_id"]
+            for row in conn.execute("SELECT task_id FROM tasks WHERE status='running'")
+        }
+    finally:
+        conn.close()
+
+    now = time.time()
+    reaped: list[int] = []
+    for pid, task_id, cwd in iter_pi_procs():
+        if task_id in running:
+            continue
+        session = find_session_file(f"pi-{task_id}", cwd)
+        if session is None:
+            continue
+        try:
+            idle = now - session.stat().st_mtime
+        except OSError:
+            continue
+        if idle < ORPHAN_IDLE:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        print(f"[reaper] orphan {task_id} pid={pid} idle={idle:.0f}s", flush=True)
+        reaped.append(pid)
+    return reaped
 
 def watchdog_loop(stop: threading.Event) -> None:
     while not stop.wait(WATCHDOG_INTERVAL):
         try:
             for tid in watchdog_tick():
                 print(f"[watchdog] resolved {tid}", flush=True)
+            reap_orphans()
         except Exception as exc:  # never let the watchdog die
             print(f"[watchdog] error: {exc}", flush=True)
 
@@ -1320,6 +1409,7 @@ def main() -> int:
     sub.add_parser("list")
     sub.add_parser("reconcile")
     sub.add_parser("watchdog")
+    sub.add_parser("reap", help="SIGTERM Pi processes whose task has no running row")
 
     a = ap.parse_args()
 
@@ -1394,6 +1484,10 @@ def main() -> int:
     if a.cmd in ("reconcile", "watchdog"):
         changed = reconcile() if a.cmd == "reconcile" else watchdog_tick()
         print(json.dumps({"changed": changed}))
+        return 0
+
+    if a.cmd == "reap":
+        print(json.dumps({"reaped": reap_orphans()}))
         return 0
 
     return 1

@@ -149,6 +149,7 @@ Every knob is an environment variable. Unset means "feature off", so a bare
 | `PI_BRIDGE_HEARTBEAT_INTERVAL` | `60` | seconds between heartbeats |
 | `PI_BRIDGE_TIMEOUT` | `7200` | default task timeout, seconds |
 | `PI_BRIDGE_WATCHDOG_INTERVAL` | `30` | seconds between watchdog ticks |
+| `PI_BRIDGE_ORPHAN_IDLE` | `900` | reap a row-less Pi process after this many idle seconds |
 | `PI_BRIDGE_MODEL` | *(unset)* | force the model Pi runs |
 | `PI_BRIDGE_FALLBACK_MODEL` | *(unset)* | model when nothing else resolves; unset = let Pi decide |
 | `PI_BRIDGE_MODEL_ALIASES` | *(unset)* | comma-separated routing aliases that are never used as model ids |
@@ -174,6 +175,18 @@ is available, because pinning Pi to a routing alias silently pins it to whatever
 the gateway default happens to be. If a resolved model is not declared in Pi's
 `models.json`, the bridge attaches the first `PI_BRIDGE_PASSTHROUGH_PROVIDERS`
 entry that Pi will accept, so an undeclared id still reaches the server.
+
+### Orphan reaping
+
+The watchdog walks tasks that still have a `running` row. A Pi process whose row
+is gone — or was never written — is therefore invisible to it, and can sit
+sleeping forever. Each watchdog tick also reaps those: a process is `SIGTERM`ed
+only when it is named `pi`, carries `PI_BRIDGE_TASK_ID`, has no `running` row,
+and has a session file that has not been written for `PI_BRIDGE_ORPHAN_IDLE`
+seconds. The session-file gate is what makes it safe: `submit()` starts Pi
+before it writes the row, so a just-spawned process has neither yet and is left
+alone, while a working one keeps touching its session file. Run it by hand with
+`pi_bridge.py reap`.
 
 ## Protocol
 
