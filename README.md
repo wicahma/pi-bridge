@@ -32,17 +32,22 @@ both gaps:
 - **Never blocks on the caller.** Notifications are fire-and-forget on daemon
   threads. A dead webhook endpoint cannot delay a task.
 
+## Requirements
+
+- Python **3.10+** — standard library only, no third-party runtime dependencies.
+- The **`pi` CLI** on `PATH` (or point `PI_BIN` at it).
+- Optional: a systemd user session, if you want the bridge to outlive your shell.
+
 ## Install
 
-Requires Python 3.10+ and the `pi` CLI on `PATH`.
-
 ```sh
-git clone <this repo> && cd pi-bridge
-pip install -e .          # or just run ./pi_bridge.py directly
+git clone https://github.com/wicahma/pi-bridge && cd pi-bridge
+pip install -e .          # provides the `pi-bridge` command
+# or run it directly, no install:  ./pi_bridge.py --help
 ```
 
-Pi's own config is untouched; see `PI_BRIDGE_PASSTHROUGH_PROVIDERS` below for
-gateway-backed setups that need arbitrary model ids.
+Pi's own config is untouched. Gateway-backed setups that serve arbitrary model
+ids should set `PI_BRIDGE_PASSTHROUGH_PROVIDERS` — see [Configuration](#configuration).
 
 ## Run
 
@@ -50,9 +55,19 @@ gateway-backed setups that need arbitrary model ids.
 pi-bridge serve           # HTTP API + watchdog + heartbeat
 ```
 
-Minimal systemd user unit in `integrations/hermes/pi-bridge.service`.
+A minimal systemd user unit is in
+[`integrations/hermes/pi-bridge.service`](integrations/hermes/pi-bridge.service);
+it works unchanged for any orchestrator, not just Hermes:
+
+```sh
+install -Dm644 integrations/hermes/pi-bridge.service ~/.config/systemd/user/pi-bridge.service
+systemctl --user daemon-reload
+systemctl --user enable --now pi-bridge
+```
 
 ## Use
+
+CLI:
 
 ```sh
 pi-bridge submit "add a /healthz endpoint and a test" --cwd /path/to/repo
@@ -63,13 +78,40 @@ pi-bridge probe  3f9a1c2e8b7d4a06     # heartbeat classification, without waitin
 pi-bridge list
 ```
 
-Over HTTP:
+HTTP:
 
 ```sh
 curl -s localhost:8799/submit -d '{"prompt":"...","cwd":"/repo"}'
 curl -s localhost:8799/status/3f9a1c2e8b7d4a06
 curl -s localhost:8799/list
 ```
+
+### CLI reference
+
+| Command | Purpose |
+| --- | --- |
+| `serve` | run the HTTP API, watchdog and heartbeat |
+| `submit "<prompt>" [--cwd DIR] [--model M] [--provider P] [--timeout S] [--session ID] [--context JSON] [--systemd]` | dispatch a task, print its id |
+| `status <id>` | current row from `state.db` |
+| `model [--explicit M] [--session ID]` | show which model Pi would use, and why |
+| `probe <id>` | classify a running task from its session file, without waiting |
+| `list` | recent tasks |
+| `reconcile` | one watchdog pass, in the foreground |
+| `watchdog` | run the watchdog loop alone |
+
+### HTTP API
+
+| Method | Path | Body / result |
+| --- | --- | --- |
+| `POST` | `/submit` | `{prompt, cwd?, model?, provider?, timeout?, session_id?, allow_alias?, context?}` → `{ok, task_id}` |
+| `POST` | `/model` | `{explicit?, session_id?, allow_alias?}` → `{ok, model, source}` |
+| `GET` | `/list` | → `{ok, tasks: [...]}` (most recent 100) |
+| `GET` | `/status/<id>` | → `{ok, task}`; `404` for an unknown id |
+| `POST` | `/callback` | Pi's own settle report (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md)) |
+
+`context` is an arbitrary JSON object, stored verbatim and echoed back in every
+notification for that task. That is the entire integration surface: the bridge
+never interprets it.
 
 ## Configuration
 
@@ -88,32 +130,94 @@ Every knob is an environment variable. Unset means "feature off", so a bare
 | `PI_BRIDGE_TIMEOUT` | `7200` | default task timeout, seconds |
 | `PI_BRIDGE_WATCHDOG_INTERVAL` | `30` | seconds between watchdog ticks |
 | `PI_BRIDGE_MODEL` | *(unset)* | force the model Pi runs |
-| `PI_BRIDGE_FALLBACK_MODEL` | `hermes` | model when nothing else resolves |
-| `PI_BRIDGE_MODEL_ALIASES` | `hermes,main-agent,…` | routing aliases never used as model ids |
-| `PI_BRIDGE_PASSTHROUGH_PROVIDERS` | `local` | providers allowed undeclared model ids |
+| `PI_BRIDGE_FALLBACK_MODEL` | *(unset)* | model when nothing else resolves; unset = let Pi decide |
+| `PI_BRIDGE_MODEL_ALIASES` | *(unset)* | comma-separated routing aliases that are never used as model ids |
+| `PI_BRIDGE_PASSTHROUGH_PROVIDERS` | *(unset)* | providers allowed to serve undeclared model ids |
 | `PI_BRIDGE_ORCHESTRATOR_DB` | *(unset)* | orchestrator SQLite db, to inherit its live model |
 | `PI_BRIDGE_ORCHESTRATOR_CONFIG` | *(unset)* | orchestrator YAML, for its default model |
 | `PI_BRIDGE_DIR` | *(unset)* | legacy alias for `PI_BRIDGE_STATE_DIR` |
 | `PI_BIN` | `pi` | pi executable |
 | `PI_CODING_AGENT_SESSION_DIR` | `~/.pi/agent/sessions` | where Pi keeps session jsonl |
 
-Model resolution order: explicit `--model` → `PI_BRIDGE_MODEL` → the
-orchestrator's live model → its configured default → `PI_BRIDGE_FALLBACK_MODEL`.
-Internal routing aliases are skipped whenever a concrete model is available,
-because pinning Pi to an alias silently pins it to whatever the gateway default
-happens to be.
+### Model resolution
+
+Pi is started with `--model` only when a model actually resolves. Order:
+
+1. explicit `--model` / `PI_BRIDGE_MODEL`
+2. the orchestrator's live model, read from `PI_BRIDGE_ORCHESTRATOR_DB`
+3. the orchestrator's default model, read from `PI_BRIDGE_ORCHESTRATOR_CONFIG`
+4. `PI_BRIDGE_FALLBACK_MODEL`, if set
+5. otherwise no `--model` at all — Pi uses its own configured default
+
+Values listed in `PI_BRIDGE_MODEL_ALIASES` are skipped whenever a concrete model
+is available, because pinning Pi to a routing alias silently pins it to whatever
+the gateway default happens to be. If a resolved model is not declared in Pi's
+`models.json`, the bridge attaches the first `PI_BRIDGE_PASSTHROUGH_PROVIDERS`
+entry that Pi will accept, so an undeclared id still reaches the server.
 
 ## Protocol
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the callback and heartbeat
 contracts, the signature scheme, and the task lifecycle.
 
-## Hermes integration
+## Integrations
 
-`integrations/hermes/` wires this bridge into
-[Hermes Agent](https://hermes-agent.nousresearch.com/docs): a plugin exposing
-`/pi_*` slash commands, a Pi extension that calls back on settle, a webhook
-route example, and a systemd unit. None of it is required by the engine.
+The engine has no orchestrator-specific code. An integration only has to:
+
+1. **Submit** — `POST /submit` with a prompt and working directory.
+2. **Receive** — expose an HTTP endpoint that verifies the HMAC signature and
+   renders the payload wherever the user lives.
+3. *(optional)* **Inherit** — point `PI_BRIDGE_ORCHESTRATOR_DB` at the
+   orchestrator's own SQLite state to reuse its live model and its routing keys.
+
+### Implemented
+
+- **[Hermes Agent](https://hermes-agent.nousresearch.com/docs)** — see
+  [`integrations/hermes/`](integrations/hermes/README.md): a plugin exposing
+  `/pi_*` slash commands, a Pi extension that calls back on settle, two webhook
+  route definitions (one mirrored into the session, one `deliver_only`), and the
+  systemd unit.
+
+### Planned / candidate
+
+These follow the same three-part contract; each is a small adapter, not engine
+work. Listed as a roadmap, not as shipped support.
+
+| Target | Kind | Integration shape |
+| --- | --- | --- |
+| ZCode (z.ai) | agent dev environment: CLI, TUI, web, desktop, bot channels | thin client calling `/submit`; a bot-channel receiver for callbacks |
+| OpenClaw | autonomous agent platform with a plugin runtime | plugin wrapping `/submit` plus a callback handler |
+| Claw Orchestrator | runtime supervising long-lived CLI agent sessions | MCP tool or ACP adapter delegating to `/submit` |
+| ACP clients (Zed, JetBrains, Neovim, Emacs) | editor-integrated agents | ACP adapter: prompt → `/submit`, callback → session update |
+| n8n and similar workflow engines | automation | HTTP Request node → `/submit`; Webhook node ← signed callback |
+| CI (GitHub Actions, Woodpecker, …) | pipelines | a step that `POST`s `/submit` and polls `/status/<id>` |
+| Anything with HTTP + HMAC | generic | the three requirements above |
+
+## Security
+
+- **Local by default.** The server binds `127.0.0.1`; it has no authentication of
+  its own, so do not expose it to a network without a proxy that adds one.
+- **Signed notifications.** Every outbound notification carries an HMAC-SHA256
+  signature over the raw body, keyed by `PI_BRIDGE_NOTIFY_SECRET`. Verify it
+  before trusting a payload — the scheme is in
+  [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+- **No secret at rest.** The bridge stores only task prompts, logs and status.
+  Secrets live in the environment, never in `state.db`.
+- **Pi runs unsandboxed.** Tasks execute with the bridge's own privileges. Run
+  the service as a user whose access you are willing to grant a coding agent,
+  and use Pi's own permission configuration to narrow it further.
+
+## Development
+
+```sh
+pip install -e '.[dev]'
+python -m pytest -q
+```
+
+## Contributing
+
+Issues and pull requests are welcome. Keep the engine dependency-free: if a
+change needs a library, it probably belongs in an integration instead.
 
 ## License
 
