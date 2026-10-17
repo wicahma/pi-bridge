@@ -525,6 +525,7 @@ def read_session_outcome(session_id: str, cwd: str) -> tuple[str, dict | None] |
     last_text: str | None = None
     last_usage: dict | None = None
     stop_reason: str | None = None
+    err_msg: str | None = None
 
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
@@ -935,6 +936,12 @@ def submit(
             f"--working-directory={cwd}",
             f"--setenv=PI_BRIDGE_CALLBACK_URL={os.environ.get('PI_BRIDGE_CALLBACK_URL') or f'http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}'}",
             f"--setenv=PI_BRIDGE_TASK_ID={task_id}",
+            # A transient unit inherits the *user manager's* environment, not the
+            # bridge's - and the manager's PATH has no ~/.local/bin. Pi lives there
+            # with a `#!/usr/bin/env node` shebang, so it died at startup with
+            # `env: 'node': No such file or directory` (exit 127) while the log file
+            # stayed empty and the watchdog only noticed at the deadline, hours later.
+            *([f"--setenv=PATH={os.environ['PATH']}", f"--setenv=PI_BIN={PI_BIN}"] if os.environ.get("PATH") else []),
             *[f"--setenv={k}={v}" for k, v in block_env.items()],
             *args,
         ]
