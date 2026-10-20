@@ -453,7 +453,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     model_source  TEXT,                   -- explicit|env|session|config|fallback
     origin_chat_id   TEXT,
     origin_thread_id TEXT,
-    context          TEXT                 -- opaque JSON supplied by the caller
+    context          TEXT,                -- opaque JSON supplied by the caller
+    parent_task_id   TEXT,                -- task this one resumed, if any
+    artifacts_json   TEXT                 -- git snapshot captured at resolution
 );
 """
 
@@ -479,6 +481,12 @@ def db() -> sqlite3.Connection:
         conn.commit()
     if "context" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN context TEXT")
+        conn.commit()
+    if "parent_task_id" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
+        conn.commit()
+    if "artifacts_json" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN artifacts_json TEXT")
         conn.commit()
     return conn
 
@@ -666,12 +674,49 @@ def pid_alive(pid: int | None) -> bool:
 # ---------------------------------------------------------------- resolution
 
 
+def capture_artifacts(cwd: str) -> dict | None:
+    """Snapshot the tree at resolution time.
+
+    Cheap (three git calls, ~50 ms) and it is the difference between the
+    orchestrator reading evidence and re-deriving it by hand on every task.
+    Returns None when the cwd is not a git work tree.
+    """
+    def run(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    head = run("log", "-1", "--format=%h %s")
+    if not head:
+        return None
+    return {
+        "head": head,
+        "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
+        "status": run("status", "--porcelain"),
+        "diffstat": run("diff", "--stat"),
+    }
+
 def resolve(task_id: str, status: str, *, text=None, usage=None,
             exit_code=None, resolution=None, resolved_by=None) -> bool:
     """
     Write a terminal outcome for a task, exactly once. Returns True if this call
     performed the transition, False if the task was already final.
     """
+    artifacts = None
+    conn = db()
+    try:
+        cwd_row = conn.execute(
+            "SELECT cwd FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if cwd_row is not None:
+        artifacts = capture_artifacts(cwd_row["cwd"])
+
     with _lock:
         conn = db()
         try:
@@ -684,7 +729,8 @@ def resolve(task_id: str, status: str, *, text=None, usage=None,
                 return False
             conn.execute(
                 """UPDATE tasks SET status=?, finished_at=?, result_text=?,
-                       usage_json=?, exit_code=?, resolution=?, resolved_by=?
+                       usage_json=?, exit_code=?, resolution=?, resolved_by=?,
+                       artifacts_json=?
                    WHERE task_id=?""",
                 (
                     status,
@@ -694,6 +740,7 @@ def resolve(task_id: str, status: str, *, text=None, usage=None,
                     exit_code,
                     resolution,
                     resolved_by,
+                    json.dumps(artifacts) if artifacts else None,
                     task_id,
                 ),
             )
@@ -889,6 +936,7 @@ def submit(
     allow_alias: bool = False,
     context: dict | None = None,
     no_commit: bool = False,
+    resume_of: str | None = None,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -899,7 +947,23 @@ def submit(
     running - that is the honest semantics of a per-task model pin.
     """
     task_id = uuid.uuid4().hex[:16]
-    session_id = f"pi-{task_id}"
+    parent = None
+    if resume_of:
+        conn = db()
+        try:
+            parent = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (resume_of,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if parent is None:
+            raise ValueError(f"unknown task: {resume_of}")
+        # Pi resolves the project from the session itself and refuses to run
+        # when the cwd disagrees, so a resume always runs where the parent ran.
+        cwd = parent["cwd"]
+        session_id = parent["session_id"]
+    else:
+        session_id = f"pi-{task_id}"
     cwd = str(Path(cwd).resolve())
     env_session, env_chat, env_thread = _env_route()
     session = session or env_session
@@ -919,7 +983,12 @@ def submit(
     log_path = LOGS_DIR / f"{task_id}.log"
 
     block_env = no_commit_env() if no_commit else {}
-    args = [PI_BIN, "-p", prompt, "--session-id", session_id, "--approve"]
+    if parent is not None:
+        # --session resumes an existing session; --session-id is mutually
+        # exclusive with it and would start a new one instead.
+        args = [PI_BIN, "-p", prompt, "--session", session_id, "--approve"]
+    else:
+        args = [PI_BIN, "-p", prompt, "--session-id", session_id, "--approve"]
     if chosen_model:
         args += ["--model", chosen_model]
     if provider:
@@ -976,13 +1045,14 @@ def submit(
         conn.execute(
             """INSERT INTO tasks (task_id, prompt, cwd, session_id, model, provider,
                    pid, status, created_at, started_at, deadline, log_path, model_source,
-                   origin_chat_id, origin_thread_id, context)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   origin_chat_id, origin_thread_id, context, parent_task_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, prompt, cwd, session_id, chosen_model, provider, pid,
                 "running", now, now, now + timeout, str(log_path), model_source,
                 origin_chat, origin_thread,
                 json.dumps(context) if context else None,
+                resume_of,
             ),
         )
         conn.commit()
@@ -1401,6 +1471,8 @@ def main() -> int:
     s.add_argument("--no-commit", action="store_true",
                    help="forbid this task from committing or pushing (enforced by git hooks)")
     s.add_argument("--context", help="opaque JSON object echoed in every notification")
+    s.add_argument("--resume-of", dest="resume_of", metavar="TASK_ID",
+                   help="continue an existing task's Pi session instead of starting fresh")
 
     st = sub.add_parser("status")
     st.add_argument("task_id")
@@ -1412,6 +1484,10 @@ def main() -> int:
 
     pr = sub.add_parser("probe", help="print the heartbeat status for a task, without waiting")
     pr.add_argument("task_id")
+
+    co = sub.add_parser("cost", help="sum token usage per repo")
+    co.add_argument("--since", type=float, default=7 * 86400,
+                    help="window in seconds (default 7 days)")
 
     sub.add_parser("list")
     sub.add_parser("reconcile")
@@ -1446,7 +1522,7 @@ def main() -> int:
         tid = submit(a.prompt, a.cwd, model=a.model, provider=a.provider,
                      timeout=a.timeout, use_systemd=a.systemd,
                      session=a.session, allow_alias=a.allow_alias, context=ctx,
-                     no_commit=a.no_commit)
+                     no_commit=a.no_commit, resume_of=a.resume_of)
         print(tid)
         return 0
 
@@ -1486,6 +1562,30 @@ def main() -> int:
         for r in rows:
             print(f"{r['task_id']}  {r['status']:<8} {r['resolution'] or '-':<16} "
                   f"{time.strftime('%H:%M:%S', time.localtime(r['created_at']))}")
+        return 0
+
+    if a.cmd == "cost":
+        cutoff = time.time() - a.since
+        conn = db()
+        try:
+            rows = conn.execute(
+                "SELECT cwd, usage_json FROM tasks "
+                "WHERE created_at>=? AND usage_json IS NOT NULL", (cutoff,)
+            ).fetchall()
+        finally:
+            conn.close()
+        totals: dict[str, list[int]] = {}
+        for r in rows:
+            try:
+                u = json.loads(r["usage_json"]) or {}
+            except ValueError:
+                continue
+            n = u.get("totalTokens") or (u.get("input", 0) + u.get("output", 0))
+            acc = totals.setdefault(r["cwd"], [0, 0])
+            acc[0] += int(n or 0)
+            acc[1] += 1
+        for cwd, (tokens, n) in sorted(totals.items(), key=lambda kv: -kv[1][0]):
+            print(f"{tokens:>12,}  {n:>4} task(s)  {cwd}")
         return 0
 
     if a.cmd in ("reconcile", "watchdog"):
