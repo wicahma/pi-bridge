@@ -117,11 +117,17 @@ curl -s localhost:8799/list
 
 | Method | Path | Body / result |
 | --- | --- | --- |
-| `POST` | `/submit` | `{prompt, cwd?, model?, provider?, timeout?, session_id?, allow_alias?, context?}` → `{ok, task_id}` |
+| `POST` | `/submit` | `{prompt, cwd?, model?, provider?, timeout?, session_id?, allow_alias?, context?, no_commit?, resume_of?, template?, append_system_prompt?, plan?, test_cmd?, max_fixes?}` → `{ok, task_id}` |
 | `POST` | `/model` | `{explicit?, session_id?, allow_alias?}` → `{ok, model, source}` |
 | `GET` | `/list` | → `{ok, tasks: [...]}` (most recent 100) |
 | `GET` | `/status/<id>` | → `{ok, task}`; `404` for an unknown id |
 | `POST` | `/callback` | Pi's own settle report (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md)) |
+
+`template` is one of `fix`, `feature`, `review`, `port`. `resume_of` names a
+finished task whose Pi session the new task continues. `test_cmd` is run when
+the task reports done, and a non-zero exit resolves it as failed; `max_fixes`
+(0 = off) chains that many follow-up attempts onto a red gate. An unknown
+template or task id answers 400 with the reason.
 
 `context` is an arbitrary JSON object, stored verbatim and echoed back in every
 notification for that task. That is the entire integration surface: the bridge

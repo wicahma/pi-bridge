@@ -41,3 +41,27 @@ def test_submit_with_array_body_is_400(server):
 
 def test_submit_with_valid_body_is_200(server):
     assert _post(server, {"prompt": "x", "cwd": "/tmp"}) == (200, {"ok": True, "task_id": "fake-id"})
+
+def test_submit_forwards_new_options(server, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(b, "submit", lambda *a, **k: seen.update(k) or "fake-id")
+    code, body = _post(server, {
+        "prompt": "x", "resume_of": "t0", "template": "fix",
+        "append_system_prompt": "be terse", "plan": True,
+        "test_cmd": "pytest -q", "max_fixes": 2, "no_commit": True,
+    })
+    assert code == 200
+    assert seen == {"model": None, "provider": None, "timeout": b.DEFAULT_TIMEOUT,
+                    "session": None, "allow_alias": False, "context": None,
+                    "no_commit": True, "resume_of": "t0", "template": "fix",
+                    "append_system_prompt": "be terse", "plan": True,
+                    "test_cmd": "pytest -q", "max_fixes": 2}
+
+def test_unknown_template_is_400(server, monkeypatch):
+    monkeypatch.setattr(b, "submit", lambda *a, **k: (_ for _ in ()).throw(ValueError("unknown template: nope")))
+    code, body = _post(server, {"prompt": "x", "template": "nope"})
+    assert code == 400 and "unknown template" in body["error"]
+
+def test_negative_max_fixes_is_400(server):
+    code, body = _post(server, {"prompt": "x", "max_fixes": -1})
+    assert code == 400

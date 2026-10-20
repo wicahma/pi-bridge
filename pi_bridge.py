@@ -1573,17 +1573,32 @@ class Handler(BaseHTTPRequestHandler):
                 timeout = int(payload.get("timeout", DEFAULT_TIMEOUT))
             except (TypeError, ValueError):
                 return self._json(400, {"ok": False, "error": "timeout must be an integer"})
-            tid = submit(
-                prompt,
-                payload.get("cwd", os.getcwd()),
-                model=payload.get("model"),
-                provider=payload.get("provider"),
-                timeout=timeout,
-                session=payload.get("session_id"),
-                allow_alias=bool(payload.get("allow_alias", False)),
-                context=payload.get("context"),
-                no_commit=bool(payload.get("no_commit", False)),
-            )
+            try:
+                max_fixes = int(payload.get("max_fixes", 0))
+            except (TypeError, ValueError):
+                return self._json(400, {"ok": False, "error": "max_fixes must be an integer"})
+            if max_fixes < 0:
+                return self._json(400, {"ok": False, "error": "max_fixes must be >= 0"})
+            try:
+                tid = submit(
+                    prompt,
+                    payload.get("cwd", os.getcwd()),
+                    model=payload.get("model"),
+                    provider=payload.get("provider"),
+                    timeout=timeout,
+                    session=payload.get("session_id"),
+                    allow_alias=bool(payload.get("allow_alias", False)),
+                    context=payload.get("context"),
+                    no_commit=bool(payload.get("no_commit", False)),
+                    resume_of=payload.get("resume_of"),
+                    template=payload.get("template"),
+                    append_system_prompt=payload.get("append_system_prompt"),
+                    plan=bool(payload.get("plan", False)),
+                    test_cmd=payload.get("test_cmd"),
+                    max_fixes=max_fixes,
+                )
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
             return self._json(200, {"ok": True, "task_id": tid})
 
         if self.path.rstrip("/") == "/model":
