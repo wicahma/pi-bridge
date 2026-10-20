@@ -923,6 +923,38 @@ def build_env(task_id: str) -> dict:
     return env
 
 
+# A task brief that states only the goal makes Pi explore instead of edit. These
+# headers carry the rules that actually stopped that: narrow scope, no invented
+# abstractions, and a verification command the caller supplies in the brief.
+TEMPLATES = {
+    "fix": (
+        "Work narrowly. Change only what the defect requires. State the root cause in "
+        "one sentence before editing. Do not refactor unrelated code and do not add "
+        "abstractions. Verify with the exact command in the brief and paste its output."
+    ),
+    "feature": (
+        "Implement the smallest change that satisfies the request. No scaffolding for "
+        "later, no config for a value that never changes, no interface with a single "
+        "implementation. Match the surrounding style exactly. Verify with the exact "
+        "command in the brief and paste its output."
+    ),
+    "review": (
+        "Review, do not rewrite. Report each defect as file:line, what breaks, and why "
+        "it matters, ordered by severity. If you find nothing, say so plainly. Do not "
+        "modify files unless the brief explicitly asks you to fix something."
+    ),
+    "port": (
+        "Port behaviour, not code. Name the source and target file for each change. "
+        "Preserve observable behaviour exactly and call out anything that cannot be "
+        "ported. Verify with the exact command in the brief and paste its output."
+    ),
+}
+
+PLAN_HINT = (
+    "Plan before editing: list the files you will touch and the exact change to each, "
+    "then execute that list without re-planning."
+)
+
 def submit(
     prompt: str,
     cwd: str,
@@ -937,6 +969,9 @@ def submit(
     context: dict | None = None,
     no_commit: bool = False,
     resume_of: str | None = None,
+    template: str | None = None,
+    append_system_prompt: str | None = None,
+    plan: bool = False,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -978,6 +1013,17 @@ def submit(
     if model_note:
         model_source = model_note
 
+    if template:
+        prefix = TEMPLATES.get(template)
+        if prefix is None:
+            raise ValueError(
+                f"unknown template: {template} (choose from {', '.join(TEMPLATES)})"
+            )
+        prompt = f"{prefix}\n\n{prompt}"
+    sys_prompt = " ".join(
+        part for part in (PLAN_HINT if plan else None, append_system_prompt) if part
+    )
+
     prompt_file = TASKS_DIR / f"{task_id}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
     log_path = LOGS_DIR / f"{task_id}.log"
@@ -993,6 +1039,8 @@ def submit(
         args += ["--model", chosen_model]
     if provider:
         args += ["--provider", provider]
+    if sys_prompt:
+        args += ["--append-system-prompt", sys_prompt]
     if extra_args:
         args += extra_args
 
@@ -1473,6 +1521,12 @@ def main() -> int:
     s.add_argument("--context", help="opaque JSON object echoed in every notification")
     s.add_argument("--resume-of", dest="resume_of", metavar="TASK_ID",
                    help="continue an existing task's Pi session instead of starting fresh")
+    s.add_argument("--template", choices=sorted(TEMPLATES),
+                   help="prepend a proven brief header (fix|feature|review|port)")
+    s.add_argument("--append-system-prompt", dest="append_system_prompt",
+                   help="extra instruction appended to Pi's system prompt")
+    s.add_argument("--plan", action="store_true",
+                   help="make Pi list its intended edits before making them")
 
     st = sub.add_parser("status")
     st.add_argument("task_id")
@@ -1522,7 +1576,9 @@ def main() -> int:
         tid = submit(a.prompt, a.cwd, model=a.model, provider=a.provider,
                      timeout=a.timeout, use_systemd=a.systemd,
                      session=a.session, allow_alias=a.allow_alias, context=ctx,
-                     no_commit=a.no_commit, resume_of=a.resume_of)
+                     no_commit=a.no_commit, resume_of=a.resume_of,
+                     template=a.template, append_system_prompt=a.append_system_prompt,
+                     plan=a.plan)
         print(tid)
         return 0
 

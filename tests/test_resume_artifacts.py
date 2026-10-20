@@ -94,3 +94,29 @@ def test_resolve_stores_artifacts(mk_task, tmp_path):
     assert b.resolve("t-art1", "done", text="ok") is True
     art = json.loads(_row("t-art1")["artifacts_json"])
     assert art["head"]
+
+def test_template_prepends_header(monkeypatch):
+    _stub_spawn(monkeypatch)
+    tid = b.submit("do it", "/tmp", template="fix")
+    stored = (b.TASKS_DIR / f"{tid}.txt").read_text(encoding="utf-8")
+    assert stored.startswith("Work narrowly.")
+    assert stored.endswith("do it")
+
+def test_unknown_template_raises(monkeypatch):
+    _stub_spawn(monkeypatch)
+    with pytest.raises(ValueError):
+        b.submit("do it", "/tmp", template="nope")
+
+def test_append_system_prompt_reaches_argv(monkeypatch):
+    captured = _stub_spawn(monkeypatch)
+    b.submit("do it", "/tmp", append_system_prompt="stay terse")
+    args = captured["args"]
+    assert "--append-system-prompt" in args
+    assert args[args.index("--append-system-prompt") + 1] == "stay terse"
+
+def test_plan_sets_append_system_prompt(monkeypatch):
+    captured = _stub_spawn(monkeypatch)
+    b.submit("do it", "/tmp", plan=True)
+    args = captured["args"]
+    assert "--append-system-prompt" in args
+    assert args[args.index("--append-system-prompt") + 1].startswith("Plan before editing:")
