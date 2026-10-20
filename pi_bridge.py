@@ -415,6 +415,7 @@ PI_SESSIONS_DIR = Path(
 )
 
 DEFAULT_TIMEOUT = int(os.environ.get("PI_BRIDGE_TIMEOUT", "7200"))  # 2h
+TEST_TIMEOUT = int(os.environ.get("PI_BRIDGE_TEST_TIMEOUT", "900"))
 WATCHDOG_INTERVAL = int(os.environ.get("PI_BRIDGE_WATCHDOG_INTERVAL", "30"))
 # An orphan is a Pi process whose task has no running row. Only reap one that has
 # gone this long without writing to its session file.
@@ -455,7 +456,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     origin_thread_id TEXT,
     context          TEXT,                -- opaque JSON supplied by the caller
     parent_task_id   TEXT,                -- task this one resumed, if any
-    artifacts_json   TEXT                 -- git snapshot captured at resolution
+    artifacts_json   TEXT,                -- git snapshot captured at resolution
+    test_cmd         TEXT                 -- verification command run on done
 );
 """
 
@@ -487,6 +489,9 @@ def db() -> sqlite3.Connection:
         conn.commit()
     if "artifacts_json" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN artifacts_json TEXT")
+        conn.commit()
+    if "test_cmd" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN test_cmd TEXT")
         conn.commit()
     return conn
 
@@ -700,6 +705,24 @@ def capture_artifacts(cwd: str) -> dict | None:
         "diffstat": run("diff", "--stat"),
     }
 
+def run_tests(cwd: str, cmd: str) -> dict:
+    """Run the caller's verification command and keep the tail.
+
+    shell=True is deliberate: test commands are written by the trusted
+    orchestrator (`pytest -q && ruff check .`), not by the model.
+    """
+    try:
+        p = subprocess.run(
+            cmd, shell=True, cwd=cwd, capture_output=True, text=True,
+            timeout=TEST_TIMEOUT,
+        )
+        out = (p.stdout + p.stderr).strip()
+        return {"cmd": cmd, "rc": p.returncode, "tail": out[-2000:]}
+    except subprocess.TimeoutExpired:
+        return {"cmd": cmd, "rc": 124, "tail": f"timed out after {TEST_TIMEOUT}s"}
+    except OSError as exc:
+        return {"cmd": cmd, "rc": 127, "tail": str(exc)}
+
 def resolve(task_id: str, status: str, *, text=None, usage=None,
             exit_code=None, resolution=None, resolved_by=None) -> bool:
     """
@@ -710,12 +733,23 @@ def resolve(task_id: str, status: str, *, text=None, usage=None,
     conn = db()
     try:
         cwd_row = conn.execute(
-            "SELECT cwd FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT cwd, test_cmd FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
     finally:
         conn.close()
     if cwd_row is not None:
         artifacts = capture_artifacts(cwd_row["cwd"])
+
+    # A task is only done if its own verification passes. The caller supplies
+    # the command; the bridge runs it once, before the terminal write, so every
+    # resolution path (callback, session file, watchdog) gets the same gate.
+    if status == "done" and cwd_row is not None and cwd_row["test_cmd"]:
+        result = run_tests(cwd_row["cwd"], cwd_row["test_cmd"])
+        artifacts = {**(artifacts or {}), "tests": result}
+        if result["rc"] != 0:
+            status = "failed"
+            text = f"tests failed (rc={result['rc']})\n{result['tail']}"
+            resolution = resolution or "test"
 
     with _lock:
         conn = db()
@@ -972,6 +1006,7 @@ def submit(
     template: str | None = None,
     append_system_prompt: str | None = None,
     plan: bool = False,
+    test_cmd: str | None = None,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -1093,14 +1128,15 @@ def submit(
         conn.execute(
             """INSERT INTO tasks (task_id, prompt, cwd, session_id, model, provider,
                    pid, status, created_at, started_at, deadline, log_path, model_source,
-                   origin_chat_id, origin_thread_id, context, parent_task_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   origin_chat_id, origin_thread_id, context, parent_task_id, test_cmd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, prompt, cwd, session_id, chosen_model, provider, pid,
                 "running", now, now, now + timeout, str(log_path), model_source,
                 origin_chat, origin_thread,
                 json.dumps(context) if context else None,
                 resume_of,
+                test_cmd,
             ),
         )
         conn.commit()
@@ -1120,6 +1156,37 @@ def submit(
 
 # ---------------------------------------------------------------- watchdog
 
+
+REVIEW_PROMPT = """Review the change made by task {parent} in {cwd}.
+
+Original request:
+---
+{request}
+---
+
+Inspect the actual change with `git log -1 --stat` and `git diff HEAD~1` (or
+`git status` plus `git diff` if the work is still uncommitted).
+
+Report each defect as file:line, what breaks, and why it matters, ordered by
+severity. If you find nothing, say so plainly. Do not modify files."""
+
+def review_task(row: sqlite3.Row, *, model=None, timeout=DEFAULT_TIMEOUT) -> str:
+    """Spawn a fresh reviewer for a finished task.
+
+    Deliberately a new session, not `resume_of`: a reviewer that shares the
+    implementer's context defends its own reasoning instead of attacking it.
+    """
+    prompt = REVIEW_PROMPT.format(
+        parent=row["task_id"], cwd=row["cwd"], request=row["prompt"]
+    )
+    return submit(
+        prompt,
+        row["cwd"],
+        model=model,
+        timeout=timeout,
+        template="review",
+        no_commit=True,
+    )
 
 def _watch_task_proc(proc: subprocess.Popen, task_id: str, log_path: str) -> None:
     """Detect process termination immediately without waiting for watchdog interval."""
@@ -1527,6 +1594,13 @@ def main() -> int:
                    help="extra instruction appended to Pi's system prompt")
     s.add_argument("--plan", action="store_true",
                    help="make Pi list its intended edits before making them")
+    s.add_argument("--test-cmd", dest="test_cmd",
+                   help="run this command on completion; a non-zero exit fails the task")
+
+    rv = sub.add_parser("review", help="spawn a fresh Pi to attack a finished task's change")
+    rv.add_argument("task_id")
+    rv.add_argument("--model")
+    rv.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
 
     st = sub.add_parser("status")
     st.add_argument("task_id")
@@ -1578,8 +1652,22 @@ def main() -> int:
                      session=a.session, allow_alias=a.allow_alias, context=ctx,
                      no_commit=a.no_commit, resume_of=a.resume_of,
                      template=a.template, append_system_prompt=a.append_system_prompt,
-                     plan=a.plan)
+                     plan=a.plan, test_cmd=a.test_cmd)
         print(tid)
+        return 0
+
+    if a.cmd == "review":
+        conn = db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (a.task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            print(f"unknown task: {a.task_id}", file=sys.stderr)
+            return 2
+        print(review_task(row, model=a.model, timeout=a.timeout))
         return 0
 
     if a.cmd == "status":
