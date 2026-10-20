@@ -63,6 +63,21 @@ def test_stream_tick_posts_one_message_per_event(tmp_path, mk_task, session_file
     assert len({p["delivery_id"] for p in sent}) == 2
 
 
+def test_stream_tick_first_sight_streams_fresh_task(tmp_path, mk_task, session_file, monkeypatch):
+    _reset()
+    sent = []
+    monkeypatch.setattr(b, "_post_signed", lambda url, payload, event: sent.append(payload))
+
+    row = mk_task(b.db(), "st9", session_id="pi-st9", cwd=str(tmp_path))
+    session_file("pi-st9", str(tmp_path), lines=[
+        {"message": {"content": [{"type": "text", "text": "already working"}]}},
+    ])
+
+    b._stream_tick(row, time.time())
+
+    assert [p["state"] for p in sent] == ["text"]
+
+
 def test_stream_tick_silent_without_new_events(tmp_path, mk_task, session_file, monkeypatch):
     _reset()
     sent = []

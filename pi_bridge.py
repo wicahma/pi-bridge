@@ -1537,8 +1537,11 @@ def _stream_tick(row: sqlite3.Row, now: float) -> None:
     if not path or not path.is_file():
         return
     if tid not in _stream_off:
-        _stream_off[tid] = path.stat().st_size
-        return
+        # A fresh session starts empty, so stream from the top. A resumed one
+        # appends to its parent's file, so start where the child began.
+        _stream_off[tid] = path.stat().st_size if row["parent_task_id"] else 0
+        if row["parent_task_id"]:
+            return
     events, off = _stream_events(path, _stream_off[tid])
     _stream_off[tid] = off
     if not events:
