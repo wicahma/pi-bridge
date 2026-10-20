@@ -460,7 +460,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     context          TEXT,                -- opaque JSON supplied by the caller
     parent_task_id   TEXT,                -- task this one resumed, if any
     artifacts_json   TEXT,                -- git snapshot captured at resolution
-    test_cmd         TEXT                 -- verification command run on done
+    test_cmd         TEXT,                -- verification command run on done
+    max_fixes        INTEGER DEFAULT 0,   -- auto-fix attempts allowed after a red gate
+    fix_attempt      INTEGER DEFAULT 0    -- how many fixes deep this task is
 );
 """
 
@@ -495,6 +497,12 @@ def db() -> sqlite3.Connection:
         conn.commit()
     if "test_cmd" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN test_cmd TEXT")
+        conn.commit()
+    if "max_fixes" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN max_fixes INTEGER DEFAULT 0")
+        conn.commit()
+    if "fix_attempt" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN fix_attempt INTEGER DEFAULT 0")
         conn.commit()
     return conn
 
@@ -621,7 +629,9 @@ def _session_activity(session_id: str, cwd: str) -> dict:
                         info["iteration"] += 1
                         info["last_tool"] = part.get("name") or part.get("toolName")
                     elif part.get("type") == "text" and part.get("text"):
-                        info["last_text"] = part["text"].strip().splitlines()[0][:140]
+                        lines = part["text"].strip().splitlines()
+                        if lines:
+                            info["last_text"] = lines[0][:140]
     except OSError:
         pass
     return info
@@ -726,6 +736,41 @@ def run_tests(cwd: str, cmd: str) -> dict:
     except OSError as exc:
         return {"cmd": cmd, "rc": 127, "tail": str(exc)}
 
+FIX_PROMPT = """Your change failed its verification gate.
+
+Command: {cmd}
+Exit code: {rc}
+
+Output tail:
+---
+{tail}
+---
+
+Fix the cause, not the test. Do not weaken or delete assertions. Keep the diff
+as small as the defect requires. Re-run the command above before you stop."""
+
+def _spawn_fix(row, test_result: dict) -> str | None:
+    """Chain one more attempt onto a task whose gate went red."""
+    attempt = (row["fix_attempt"] or 0) + 1
+    if attempt > (row["max_fixes"] or 0):
+        return None
+    prompt = FIX_PROMPT.format(
+        cmd=test_result["cmd"], rc=test_result["rc"], tail=test_result["tail"]
+    )
+    return submit(
+        prompt,
+        row["cwd"],
+        model=row["model"],
+        provider=row["provider"],
+        timeout=DEFAULT_TIMEOUT,
+        test_cmd=row["test_cmd"],
+        max_fixes=row["max_fixes"],
+        fix_attempt=attempt,
+        resume_of=row["task_id"],
+        template="fix",
+        no_commit=True,
+    )
+
 def resolve(task_id: str, status: str, *, text=None, usage=None,
             exit_code=None, resolution=None, resolved_by=None) -> bool:
     """
@@ -736,7 +781,7 @@ def resolve(task_id: str, status: str, *, text=None, usage=None,
     conn = db()
     try:
         cwd_row = conn.execute(
-            "SELECT cwd, test_cmd FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
     finally:
         conn.close()
@@ -753,6 +798,10 @@ def resolve(task_id: str, status: str, *, text=None, usage=None,
             status = "failed"
             text = f"tests failed (rc={result['rc']})\n{result['tail']}"
             resolution = resolution or "test"
+            child = _spawn_fix(cwd_row, result)
+            if child:
+                text += f"\nauto-fix spawned: {child}"
+                artifacts = {**artifacts, "fix_task": child}
 
     with _lock:
         conn = db()
@@ -1010,6 +1059,8 @@ def submit(
     append_system_prompt: str | None = None,
     plan: bool = False,
     test_cmd: str | None = None,
+    max_fixes: int = 0,
+    fix_attempt: int = 0,
 ) -> str:
     """
     Spawn a Pi task and return immediately. Nothing here blocks on Pi.
@@ -1131,8 +1182,9 @@ def submit(
         conn.execute(
             """INSERT INTO tasks (task_id, prompt, cwd, session_id, model, provider,
                    pid, status, created_at, started_at, deadline, log_path, model_source,
-                   origin_chat_id, origin_thread_id, context, parent_task_id, test_cmd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   origin_chat_id, origin_thread_id, context, parent_task_id, test_cmd,
+                   max_fixes, fix_attempt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, prompt, cwd, session_id, chosen_model, provider, pid,
                 "running", now, now, now + timeout, str(log_path), model_source,
@@ -1140,6 +1192,8 @@ def submit(
                 json.dumps(context) if context else None,
                 resume_of,
                 test_cmd,
+                max_fixes,
+                fix_attempt,
             ),
         )
         conn.commit()
@@ -1453,16 +1507,20 @@ def heartbeat_loop(stop: threading.Event) -> None:
             for row in rows:
                 tid = row["task_id"]
                 alive.add(tid)
-                act = _session_activity(row["session_id"], row["cwd"])
-                sig = (act["bytes"], act["iteration"], act["last_tool"], act["last_text"])
-                if not _hb_should_send(tid, sig, now):
-                    continue
-                payload = task_status(row, act)
-                payload["reason"] = "activity" if _hb_seen.get(tid) != sig else "idle"
-                payload["delivery_id"] = f"{tid}-hb-{int(now)}"
-                _post_signed(HEARTBEAT_URL, payload, "pi-status")
-                _hb_seen[tid] = sig
-                _hb_sent[tid] = now
+                try:
+                    act = _session_activity(row["session_id"], row["cwd"])
+                    sig = (act["bytes"], act["iteration"], act["last_tool"], act["last_text"])
+                    if not _hb_should_send(tid, sig, now):
+                        continue
+                    payload = task_status(row, act)
+                    payload["reason"] = "activity" if _hb_seen.get(tid) != sig else "idle"
+                    payload["delivery_id"] = f"{tid}-hb-{int(now)}"
+                    _post_signed(HEARTBEAT_URL, payload, "pi-status")
+                    _hb_seen[tid] = sig
+                    _hb_sent[tid] = now
+                except Exception as exc:
+                    # One unparseable session must not silence every other task.
+                    print(f"[heartbeat] {tid}: {exc}", flush=True)
             for tid in list(_hb_seen):
                 if tid not in alive:
                     _hb_seen.pop(tid, None)
@@ -1630,6 +1688,8 @@ def main() -> int:
                    help="make Pi list its intended edits before making them")
     s.add_argument("--test-cmd", dest="test_cmd",
                    help="run this command on completion; a non-zero exit fails the task")
+    s.add_argument("--max-fixes", dest="max_fixes", type=int, default=0,
+                   help="auto-fix attempts allowed after a red --test-cmd gate")
 
     rv = sub.add_parser("review", help="spawn a fresh Pi to attack a finished task's change")
     rv.add_argument("task_id")
@@ -1686,7 +1746,8 @@ def main() -> int:
                      session=a.session, allow_alias=a.allow_alias, context=ctx,
                      no_commit=a.no_commit, resume_of=a.resume_of,
                      template=a.template, append_system_prompt=a.append_system_prompt,
-                     plan=a.plan, test_cmd=a.test_cmd)
+                     plan=a.plan, test_cmd=a.test_cmd,
+                     max_fixes=a.max_fixes)
         print(tid)
         return 0
 

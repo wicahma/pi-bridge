@@ -96,3 +96,63 @@ def test_review_uses_review_template(monkeypatch, mk_task, tmp_path):
     new_id = b.review_task(_row("t-parent2"))
     stored = (b.TASKS_DIR / f"{new_id}.txt").read_text(encoding="utf-8")
     assert stored.startswith("Review, do not rewrite.")
+
+def _children(parent_id):
+    conn = b.db()
+    try:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE parent_task_id=?", (parent_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+def _red_gate(monkeypatch):
+    """_stub_spawn patches Popen globally, so nothing may shell out for real."""
+    monkeypatch.setattr(b, "capture_artifacts", lambda cwd: {})
+    monkeypatch.setattr(b, "run_tests",
+                        lambda cwd, cmd: {"cmd": cmd, "rc": 1, "tail": "boom"})
+
+def test_fix_chain_spawns_child(monkeypatch, mk_task, tmp_path):
+    _stub_spawn(monkeypatch)
+    _red_gate(monkeypatch)
+    conn = b.db()
+    try:
+        mk_task(conn, "t1", test_cmd="false", max_fixes=1, cwd=str(tmp_path))
+    finally:
+        conn.close()
+
+    assert b.resolve("t1", "done", text="ok") is True
+    row = _row("t1")
+    assert row["status"] == "failed"
+    assert "auto-fix spawned:" in row["result_text"]
+    kids = _children("t1")
+    assert len(kids) == 1
+    assert kids[0]["fix_attempt"] == 1
+
+def test_fix_chain_stops_at_limit(monkeypatch, mk_task, tmp_path):
+    _stub_spawn(monkeypatch)
+    _red_gate(monkeypatch)
+    conn = b.db()
+    try:
+        mk_task(conn, "t2", test_cmd="false", max_fixes=0, cwd=str(tmp_path))
+    finally:
+        conn.close()
+
+    assert b.resolve("t2", "done", text="ok") is True
+    assert _row("t2")["status"] == "failed"
+    assert _children("t2") == []
+
+def test_child_prompt_carries_failure_tail(monkeypatch, mk_task, tmp_path):
+    _stub_spawn(monkeypatch)
+    _red_gate(monkeypatch)
+    conn = b.db()
+    try:
+        mk_task(conn, "t3", test_cmd="false", max_fixes=1, cwd=str(tmp_path))
+    finally:
+        conn.close()
+
+    assert b.resolve("t3", "done", text="ok") is True
+    kid = _children("t3")[0]
+    stored = (b.TASKS_DIR / f"{kid['task_id']}.txt").read_text(encoding="utf-8")
+    assert "Exit code: 1" in stored
+    assert "Fix the cause, not the test." in stored
