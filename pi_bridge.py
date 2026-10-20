@@ -90,6 +90,8 @@ HEARTBEAT_INTERVAL = int(os.environ.get("PI_BRIDGE_HEARTBEAT_INTERVAL", "60"))
 # Silence longer than this still produces one line, so a wedged task is not
 # indistinguishable from a busy one. 0 disables the keepalive entirely.
 HEARTBEAT_IDLE = int(os.environ.get("PI_BRIDGE_HEARTBEAT_IDLE", "600"))
+STREAM = int(os.environ.get("PI_BRIDGE_STREAM", "0") or 0)
+STREAM_MAX = max(1, int(os.environ.get("PI_BRIDGE_STREAM_MAX", "6") or 6))
 
 
 def _task_context(row: sqlite3.Row) -> dict:
@@ -636,6 +638,48 @@ def _session_activity(session_id: str, cwd: str) -> dict:
         pass
     return info
 
+
+def _stream_events(path, off: int) -> tuple[list[tuple[str, str]], int]:
+    """New (kind, text) events written to the session file since `off`.
+
+    Only whole lines are consumed: a half-written jsonl line stays unread and
+    the returned offset stops before it, so the next tick sees it complete.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(off)
+            chunk = fh.read()
+    except OSError:
+        return [], off
+    end = chunk.rfind(b"\n")
+    if end == -1:
+        return [], off
+    events: list[tuple[str, str]] = []
+    for raw in chunk[: end + 1].decode("utf-8", "replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") == "toolCall":
+                name = part.get("name") or part.get("toolName") or "tool"
+                args = part.get("arguments") or part.get("args") or {}
+                if isinstance(args, dict):
+                    hint = args.get("command") or args.get("path") or args.get("pattern") or ""
+                else:
+                    hint = ""
+                hint = str(hint).splitlines()[0][:160] if str(hint).strip() else ""
+                events.append(("tool", f"{name} {hint}".strip()))
+            elif part.get("type") == "text" and part.get("text", "").strip():
+                text = part["text"].strip()
+                events.append(("text", text[:280] + ("…" if len(text) > 280 else "")))
+    return events, off + end + 1
 
 def task_status(row: sqlite3.Row, act: dict | None = None) -> dict:
     """Classify a running task for the heartbeat: what state, how long, how far."""
@@ -1477,6 +1521,7 @@ def watchdog_loop(stop: threading.Event) -> None:
 
 _hb_seen: dict[str, tuple] = {}
 _hb_sent: dict[str, float] = {}
+_stream_off: dict[str, int] = {}
 
 def _hb_should_send(task_id: str, sig: tuple, now: float) -> bool:
     """Send when the snapshot changed, or when the task has been quiet too long."""
@@ -1485,6 +1530,43 @@ def _hb_should_send(task_id: str, sig: tuple, now: float) -> bool:
     if HEARTBEAT_IDLE <= 0:
         return False
     return now - _hb_sent.get(task_id, 0.0) >= HEARTBEAT_IDLE
+
+def _stream_tick(row: sqlite3.Row, now: float) -> None:
+    tid = row["task_id"]
+    path = find_session_file(row["session_id"], row["cwd"])
+    if not path or not path.is_file():
+        return
+    if tid not in _stream_off:
+        _stream_off[tid] = path.stat().st_size
+        return
+    events, off = _stream_events(path, _stream_off[tid])
+    _stream_off[tid] = off
+    if not events:
+        sig = (path.stat().st_size,)
+        if _hb_should_send(tid, sig, now):
+            payload = task_status(row)
+            payload["reason"] = "idle"
+            payload["delivery_id"] = f"{tid}-hb-{int(now)}"
+            _post_signed(HEARTBEAT_URL, payload, "pi-status")
+            _hb_seen[tid] = sig
+            _hb_sent[tid] = now
+        return
+    for i, (kind, text) in enumerate(events[:STREAM_MAX]):
+        payload = task_status(row)
+        payload["state"] = kind
+        payload["detail"] = text
+        payload["reason"] = "stream"
+        payload["delivery_id"] = f"{tid}-st-{int(now)}-{i}"
+        _post_signed(HEARTBEAT_URL, payload, "pi-status")
+    if len(events) > STREAM_MAX:
+        payload = task_status(row)
+        payload["state"] = "busy"
+        payload["detail"] = f"+{len(events) - STREAM_MAX} more"
+        payload["reason"] = "stream"
+        payload["delivery_id"] = f"{tid}-st-{int(now)}-x"
+        _post_signed(HEARTBEAT_URL, payload, "pi-status")
+    _hb_seen[tid] = (path.stat().st_size,)
+    _hb_sent[tid] = now
 
 def heartbeat_loop(stop: threading.Event) -> None:
     """Push a status line only when Pi produced something new.
@@ -1508,6 +1590,9 @@ def heartbeat_loop(stop: threading.Event) -> None:
                 tid = row["task_id"]
                 alive.add(tid)
                 try:
+                    if STREAM:
+                        _stream_tick(row, now)
+                        continue
                     act = _session_activity(row["session_id"], row["cwd"])
                     sig = (act["bytes"], act["iteration"], act["last_tool"], act["last_text"])
                     if not _hb_should_send(tid, sig, now):
@@ -1525,6 +1610,7 @@ def heartbeat_loop(stop: threading.Event) -> None:
                 if tid not in alive:
                     _hb_seen.pop(tid, None)
                     _hb_sent.pop(tid, None)
+                    _stream_off.pop(tid, None)
         except Exception as exc:  # never let the heartbeat die
             print(f"[heartbeat] error: {exc}", flush=True)
 

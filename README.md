@@ -153,6 +153,8 @@ Every knob is an environment variable. Unset means "feature off", so a bare
 | `PI_BRIDGE_NOTIFY_SECRET` | *(unset)* | HMAC-SHA256 key for those notifications |
 | `PI_BRIDGE_HEARTBEAT_URL` | *(unset)* | POST periodic status here |
 | `PI_BRIDGE_HEARTBEAT_INTERVAL` | `60` | seconds between heartbeats |
+| `PI_BRIDGE_STREAM` | `0` | `1` forwards every new tool call and assistant text block as its own status message instead of one digest per tick |
+| `PI_BRIDGE_STREAM_MAX` | `6` | events posted per tick when streaming; the rest collapse into one `+N more` line |
 | `PI_BRIDGE_TIMEOUT` | `7200` | default task timeout, seconds |
 | `PI_BRIDGE_WATCHDOG_INTERVAL` | `30` | seconds between watchdog ticks |
 | `PI_BRIDGE_ORPHAN_IDLE` | `900` | reap a row-less Pi process after this many idle seconds |
