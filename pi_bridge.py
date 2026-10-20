@@ -87,6 +87,9 @@ NOTIFY_SECRET = os.environ.get("PI_BRIDGE_NOTIFY_SECRET", "")
 # is never silent. Unset -> no heartbeat.
 HEARTBEAT_URL = os.environ.get("PI_BRIDGE_HEARTBEAT_URL", "")
 HEARTBEAT_INTERVAL = int(os.environ.get("PI_BRIDGE_HEARTBEAT_INTERVAL", "60"))
+# Silence longer than this still produces one line, so a wedged task is not
+# indistinguishable from a busy one. 0 disables the keepalive entirely.
+HEARTBEAT_IDLE = int(os.environ.get("PI_BRIDGE_HEARTBEAT_IDLE", "600"))
 
 
 def _task_context(row: sqlite3.Row) -> dict:
@@ -624,13 +627,13 @@ def _session_activity(session_id: str, cwd: str) -> dict:
     return info
 
 
-def task_status(row: sqlite3.Row) -> dict:
+def task_status(row: sqlite3.Row, act: dict | None = None) -> dict:
     """Classify a running task for the heartbeat: what state, how long, how far."""
     now = time.time()
     elapsed = int(now - (row["started_at"] or row["created_at"]))
     # pid is None for --systemd tasks; there the process is alive, we just cannot see it.
     alive = True if row["pid"] is None else pid_alive(row["pid"])
-    act = _session_activity(row["session_id"], row["cwd"])
+    act = act if act is not None else _session_activity(row["session_id"], row["cwd"])
     log_err = _read_log_error(row["log_path"])
 
     stale = act["age"] is not None and act["age"] > HEARTBEAT_INTERVAL * 3
@@ -1418,8 +1421,24 @@ def watchdog_loop(stop: threading.Event) -> None:
             print(f"[watchdog] error: {exc}", flush=True)
 
 
+_hb_seen: dict[str, tuple] = {}
+_hb_sent: dict[str, float] = {}
+
+def _hb_should_send(task_id: str, sig: tuple, now: float) -> bool:
+    """Send when the snapshot changed, or when the task has been quiet too long."""
+    if _hb_seen.get(task_id) != sig:
+        return True
+    if HEARTBEAT_IDLE <= 0:
+        return False
+    return now - _hb_sent.get(task_id, 0.0) >= HEARTBEAT_IDLE
+
 def heartbeat_loop(stop: threading.Event) -> None:
-    """Push a status line for every running task, so a long run is never silent."""
+    """Push a status line only when Pi produced something new.
+
+    Pi writes almost nothing to stdout, so the session jsonl is the liveness
+    signal: its size plus the last tool/text is the change signature. A fixed
+    timer instead repeated the same line every minute for hours.
+    """
     while not stop.wait(HEARTBEAT_INTERVAL):
         try:
             conn = db()
@@ -1429,10 +1448,25 @@ def heartbeat_loop(stop: threading.Event) -> None:
                 ).fetchall()
             finally:
                 conn.close()
+            now = time.time()
+            alive = set()
             for row in rows:
-                payload = task_status(row)
-                payload["delivery_id"] = f"{row['task_id']}-hb-{int(time.time())}"
+                tid = row["task_id"]
+                alive.add(tid)
+                act = _session_activity(row["session_id"], row["cwd"])
+                sig = (act["bytes"], act["iteration"], act["last_tool"], act["last_text"])
+                if not _hb_should_send(tid, sig, now):
+                    continue
+                payload = task_status(row, act)
+                payload["reason"] = "activity" if _hb_seen.get(tid) != sig else "idle"
+                payload["delivery_id"] = f"{tid}-hb-{int(now)}"
                 _post_signed(HEARTBEAT_URL, payload, "pi-status")
+                _hb_seen[tid] = sig
+                _hb_sent[tid] = now
+            for tid in list(_hb_seen):
+                if tid not in alive:
+                    _hb_seen.pop(tid, None)
+                    _hb_sent.pop(tid, None)
         except Exception as exc:  # never let the heartbeat die
             print(f"[heartbeat] error: {exc}", flush=True)
 
